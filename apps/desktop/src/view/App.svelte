@@ -377,7 +377,7 @@
           {@const agentRunning = viewModel.isAgentRunning(session.id)}
           {@const activity = viewModel.activityFor(session.id)}
           {@const memoryLabel = viewModel.memoryLabelFor(session.id)}
-          <article hidden={!poppedSessionId && !visibleSessions.some((visible) => visible.id === session.id)} role="group" aria-label={`${session.title} terminal session`} class:active={session.id === viewModel.selectedSessionId} class="session-card" oncontextmenu={(event) => openSessionMenu(event, session.id)}>
+          <article hidden={!poppedSessionId && !visibleSessions.some((visible) => visible.id === session.id)} role="group" aria-label={`${session.title} terminal session`} class:active={session.id === viewModel.selectedSessionId} class:grid-left={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id === session.id} class:grid-right={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id !== session.id && visibleSessions.some((visible) => visible.id === session.id)} class="session-card" oncontextmenu={(event) => openSessionMenu(event, session.id)}>
             <header class="card-header">
               <div class="session-identity"><span class="cli-badge">{session.cli ? session.cli.slice(0, 1).toUpperCase() : '$'}</span><strong title={session.title}>{session.title}</strong><span class="agent">{session.cli ? `${cliNames[session.cli]}${session.model ? ` · ${session.model}` : ''}` : 'shell'}</span>
                 {#if session.cli}<span class="activity-chip" data-activity={activity} title={activityLabels[activity]}>{activity === 'working' ? 'Working' : activity === 'waiting' ? 'Needs you' : 'Ready'}</span>{/if}
