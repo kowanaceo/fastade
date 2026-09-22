@@ -364,6 +364,24 @@ export class AppViewModel {
     if (this.sessions.some((item) => item.id === sessionId)) this.selectedGroupId = this.groupForSession(sessionId);
   }
 
+  /** Selects the next live session in the same top-to-bottom order used by
+   * the session drawer, wrapping at either end. Saved profiles and stopped
+   * sessions are not open terminal panes, so keyboard navigation skips them. */
+  cycleSession(reverse = false): string | null {
+    const sessionIds = this.sessionGroups.flatMap((group) =>
+      group.sessions.filter((session) => session.status === 'running').map((session) => session.id),
+    );
+    if (!sessionIds.length) return null;
+
+    const selectedIndex = sessionIds.indexOf(this.selectedSessionId ?? '');
+    const nextIndex = selectedIndex < 0
+      ? (reverse ? sessionIds.length - 1 : 0)
+      : (selectedIndex + (reverse ? -1 : 1) + sessionIds.length) % sessionIds.length;
+    const sessionId = sessionIds[nextIndex];
+    this.selectSession(sessionId);
+    return sessionId;
+  }
+
   selectGroup(groupId: string): void {
     this.selectedGroupId = groupId;
     const group = this.sessionGroups.find((item) => item.id === groupId);

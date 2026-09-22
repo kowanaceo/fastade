@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { createDesktopClient } from '../application/client-provider';
   import { type CliKind, type WebAgent } from '../domain/session';
@@ -62,12 +62,24 @@
     return hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h` : `${hours}h ${minutes}m`;
   }
 
+  async function focusTerminal(sessionId: string): Promise<void> {
+    await tick();
+    document.querySelector<HTMLElement>(`[data-session-id="${CSS.escape(sessionId)}"] .xterm-helper-textarea`)?.focus();
+  }
+
   function handleGlobalKeydown(event: KeyboardEvent): void {
     if ((event.metaKey || event.ctrlKey) && ['=', '+', '-', '_', '0'].includes(event.key)) {
       event.preventDefault();
       if (event.key === '0') viewModel.resetFontSize();
       else if (event.key === '-' || event.key === '_') viewModel.decreaseFontSize();
       else viewModel.increaseFontSize();
+      return;
+    }
+    if (!poppedSessionId && event.ctrlKey && event.key === 'Tab') {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const sessionId = viewModel.cycleSession(event.shiftKey);
+      if (sessionId) void focusTerminal(sessionId);
       return;
     }
     if (event.key !== 'Escape') return;
@@ -397,7 +409,7 @@
           {@const agentRunning = viewModel.isAgentRunning(session.id)}
           {@const activity = viewModel.activityFor(session.id)}
           {@const memoryLabel = viewModel.memoryLabelFor(session.id)}
-          <article hidden={!poppedSessionId && !visibleSessions.some((visible) => visible.id === session.id)} role="group" aria-label={`${session.title} terminal session`} class:active={session.id === viewModel.selectedSessionId} class:grid-left={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id === session.id} class:grid-right={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id !== session.id && visibleSessions.some((visible) => visible.id === session.id)} class="session-card" oncontextmenu={(event) => openSessionMenu(event, session.id)}>
+          <article data-session-id={session.id} hidden={!poppedSessionId && !visibleSessions.some((visible) => visible.id === session.id)} role="group" aria-label={`${session.title} terminal session`} class:active={session.id === viewModel.selectedSessionId} class:grid-left={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id === session.id} class:grid-right={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id !== session.id && visibleSessions.some((visible) => visible.id === session.id)} class="session-card" oncontextmenu={(event) => openSessionMenu(event, session.id)}>
             <header class="card-header">
               <div class="session-identity"><span class="cli-badge">{session.cli ? session.cli.slice(0, 1).toUpperCase() : '$'}</span><strong title={session.title}>{session.title}</strong><span class="agent">{session.cli ? `${cliNames[session.cli]}${session.model ? ` · ${session.model}` : ''}` : 'shell'}</span>
                 {#if session.cli}<span class="activity-chip" data-activity={activity} title={activityLabels[activity]}>{activity === 'working' ? 'Working' : activity === 'waiting' ? 'Needs you' : 'Ready'}</span>{/if}
