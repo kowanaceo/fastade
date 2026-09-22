@@ -13,15 +13,21 @@
   export let onFocus: (sessionId: string) => void;
   export let onCurrentDirectory: (sessionId: string, path: string) => void;
   export let fontSize = 11;
+  export let layoutRevision = 0;
 
   let container: HTMLDivElement;
   let terminalRef: Terminal | undefined;
   let fitRef: FitAddon | undefined;
+  let scheduleFitRef: (() => void) | undefined;
 
   $: if (terminalRef && terminalRef.options.fontSize !== fontSize) {
     terminalRef.options.fontSize = fontSize;
-    try { fitRef?.fit(); } catch { /* hidden terminal; retry on next resize */ }
+    scheduleFitRef?.();
   }
+
+  // Native window resize/scale events are more reliable than DOM resize events
+  // while WKWebView is entering fullscreen or moving between displays.
+  $: if (terminalRef && layoutRevision > 0) scheduleFitRef?.();
 
   onMount(() => {
     const terminal = new Terminal({
@@ -31,11 +37,15 @@
       fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Apple SD Gothic Neo", "Noto Sans Mono CJK KR", monospace',
       fontSize,
       lineHeight: 1.15,
+      overviewRuler: { width: 5 },
       scrollback: 5000,
       theme: {
         background: '#0b100d',
         foreground: '#d6e0d9',
         cursor: '#8eefaa',
+        scrollbarSliderBackground: '#34413999',
+        scrollbarSliderHoverBackground: '#526158cc',
+        scrollbarSliderActiveBackground: '#627268e6',
         selectionBackground: '#385744',
       },
     });
@@ -99,16 +109,31 @@
       return false;
     });
     let fitFrame = 0;
+    let fitTimers: Array<ReturnType<typeof setTimeout>> = [];
+    const fitAndRefresh = (): void => {
+      try {
+        fit.fit();
+        // fit() is a no-op when the row/column count stays the same. A forced
+        // redraw is still needed after the WebView backing scale changes.
+        if (terminal.rows > 0) terminal.refresh(0, terminal.rows - 1);
+      } catch { /* hidden terminal; retry on next resize */ }
+    };
     const scheduleFit = (): void => {
       cancelAnimationFrame(fitFrame);
+      fitTimers.forEach((timer) => clearTimeout(timer));
+      fitTimers = [];
       fitFrame = requestAnimationFrame(() => {
         // A second frame observes the final content size after macOS finishes
         // a fullscreen animation or moves the window between display scales.
         fitFrame = requestAnimationFrame(() => {
-          try { fit.fit(); } catch { /* hidden terminal; retry on next resize */ }
+          fitAndRefresh();
         });
       });
+      // Native fullscreen transitions can finish well after ResizeObserver's
+      // last callback. Re-fit through the end of that transition.
+      fitTimers = [120, 350, 700].map((delay) => setTimeout(fitAndRefresh, delay));
     };
+    scheduleFitRef = scheduleFit;
     const observer = new ResizeObserver(scheduleFit);
     let resolutionQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
     const handleResolutionChange = (): void => {
@@ -126,6 +151,8 @@
     requestAnimationFrame(() => terminal.focus());
     return () => {
       cancelAnimationFrame(fitFrame);
+      fitTimers.forEach((timer) => clearTimeout(timer));
+      scheduleFitRef = undefined;
       observer.disconnect();
       window.removeEventListener('resize', scheduleFit);
       window.removeEventListener('focus', scheduleFit);
@@ -161,5 +188,5 @@
      and caused bottom-anchored choice prompts to overlap their content. */
   .terminal-host { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: #0b100d; }
   :global(.xterm) { width: 100%; height: 100%; padding: 0 0 11px; }
-  :global(.xterm-viewport) { scrollbar-width: thin; }
+  :global(.xterm-viewport) { scrollbar-color: #34413999 transparent; scrollbar-width: thin; }
 </style>

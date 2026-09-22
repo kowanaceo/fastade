@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
   import { createDesktopClient } from '../application/client-provider';
   import { type CliKind, type WebAgent } from '../domain/session';
   import { AppViewModel } from '../viewmodel/app-view-model.svelte';
@@ -36,6 +37,7 @@
   let usageOpen = $state(true);
   let editingAgentId = $state<string | null>(null);
   let agentDraft = $state<WebAgent>(emptyAgent());
+  let terminalLayoutRevision = $state(0);
 
   function emptyAgent(): WebAgent {
     return { id: `web-${crypto.randomUUID()}`, name: '', chatUrl: '', usageUrl: '', accent: '#8eefaa', enabled: true };
@@ -186,11 +188,29 @@
   }
 
   onMount(() => {
+    let disposed = false;
+    let terminalLayoutFrame = 0;
+    const nativeWindowUnlisteners: Array<() => void> = [];
+    const notifyTerminalLayoutChanged = (): void => {
+      cancelAnimationFrame(terminalLayoutFrame);
+      terminalLayoutFrame = requestAnimationFrame(() => { terminalLayoutRevision += 1; });
+    };
+    void Promise.allSettled([
+      getCurrentWindow().onResized(notifyTerminalLayoutChanged),
+      getCurrentWindow().onScaleChanged(notifyTerminalLayoutChanged),
+    ]).then((results) => {
+      const unlisteners = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+      if (disposed) unlisteners.forEach((unlisten) => unlisten());
+      else nativeWindowUnlisteners.push(...unlisteners);
+    });
     window.addEventListener('keydown', handleGlobalKeydown, { capture: true });
     window.addEventListener('click', closeContextMenus);
     window.addEventListener('contextmenu', handleGlobalContextMenu, { capture: true });
     void viewModel.load({ auxiliaryWindow: Boolean(poppedSessionId) });
     return () => {
+      disposed = true;
+      cancelAnimationFrame(terminalLayoutFrame);
+      nativeWindowUnlisteners.forEach((unlisten) => unlisten());
       window.removeEventListener('keydown', handleGlobalKeydown, { capture: true });
       window.removeEventListener('click', closeContextMenus);
       window.removeEventListener('contextmenu', handleGlobalContextMenu, { capture: true });
@@ -401,6 +421,7 @@
             <TerminalPane
               sessionId={session.id}
               fontSize={viewModel.fontSize}
+              layoutRevision={terminalLayoutRevision}
               registerOutput={(id, sink) => viewModel.registerTerminal(id, sink)}
               onInput={(id, data) => void viewModel.writeTerminal(id, data)}
               onResize={(id, cols, rows) => void viewModel.resizeTerminal(id, cols, rows)}

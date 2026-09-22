@@ -4,11 +4,18 @@ Codex CLI, Claude Code, Gemini CLI 세션을 한곳에서 실행하고 관리하
 
 > 이 프로젝트는 현재 초기 개발 단계입니다. 데이터 형식과 기능이 예고 없이 바뀔 수 있으며, 모바일의 실제 원격 세션 연결은 아직 완성되지 않았습니다.
 
-## 다운로드
+## 설치
 
-- **macOS (Apple Silicon)**: [최신 릴리즈에서 `.dmg` 다운로드](https://github.com/kowanaceo/fastade/releases/latest)
-- 앱이 서명/공증되지 않아 처음 실행 시 Gatekeeper가 막을 수 있습니다. dmg를 마운트한 뒤 Finder에서 `fastade.app`을 우클릭 → 열기로 실행하세요.
-- Intel Mac, Windows, Linux 빌드는 아직 제공하지 않습니다.
+미리 빌드된 설치 파일은 제공하지 않습니다. 저장소를 내려받아 직접 빌드하세요.
+
+```bash
+git clone https://github.com/kowanaceo/fastade.git
+cd fastade
+npm install
+npm run tauri:build
+```
+
+macOS 빌드 결과물은 `apps/desktop/src-tauri/target/release/bundle/`에 생성됩니다. 빌드에 필요한 도구는 아래 요구 사항을 참고하세요.
 
 ## 주요 기능
 
