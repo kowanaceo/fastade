@@ -27,16 +27,30 @@ use session::{
 };
 use ssh_config::list_ssh_hosts;
 use usage::get_agent_usage;
-use windows::open_session_window;
+use windows::{
+    fit_window_after_resize, fit_windows_after_display_change, open_session_window,
+    watch_display_changes,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| match event {
+            // Moving to a screen with a different scale is part of a display
+            // reconfiguration too; the screen-parameters notification alone
+            // can fire before the window lands on its final screen.
+            tauri::WindowEvent::ScaleFactorChanged { .. } => {
+                fit_windows_after_display_change(window.app_handle());
+            }
+            tauri::WindowEvent::Resized(_) => fit_window_after_resize(window),
+            _ => {}
+        })
         .setup(|app| {
             let state = AppState::load(app.handle()).map_err(std::io::Error::other)?;
             app.manage(state);
             mcp::start(app.handle().clone());
+            watch_display_changes(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

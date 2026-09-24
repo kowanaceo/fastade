@@ -238,6 +238,7 @@
     <aside aria-label="Session drawer">
       <header class="brand">
         <span class="brand-word"><em>fast</em>ade</span>
+        <span class="brand-version">v{__APP_VERSION__}</span>
         <button class="icon-button settings-button" onclick={() => viewModel.toggleSettings()} aria-label="AI agent settings" title="AI agent settings">⚙</button>
         <button class="icon-button drawer-close" onclick={() => viewModel.toggleDrawer()} aria-label="Close drawer">‹</button>
       </header>

@@ -95,11 +95,19 @@
       onCurrentDirectory(sessionId, data);
       return true;
     });
-    const resized = terminal.onResize(({ cols, rows }) => {
+    let lastSyncedSize = '';
+    const syncPtySize = (cols: number, rows: number): void => {
       // A session can be visible in both the main window and a pop-out. Only
       // the focused window owns the live PTY size; otherwise two observers
       // continually overwrite each other with different rows and columns.
-      if (document.hasFocus()) onResize(sessionId, cols, rows);
+      if (!document.hasFocus() || cols < 1 || rows < 1) return;
+      const size = `${cols}x${rows}`;
+      if (size === lastSyncedSize) return;
+      lastSyncedSize = size;
+      onResize(sessionId, cols, rows);
+    };
+    const resized = terminal.onResize(({ cols, rows }) => {
+      syncPtySize(cols, rows);
     });
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.key !== 'Escape' || event.type !== 'keydown') return true;
@@ -113,6 +121,12 @@
     const fitAndRefresh = (): void => {
       try {
         fit.fit();
+        // xterm may have accepted its new geometry while the native window
+        // briefly had no focus during a fullscreen/display transition. In
+        // that case onResize deliberately skipped the PTY update, and a later
+        // fit() is a no-op. Explicitly synchronize the current geometry once
+        // this window owns the session again.
+        syncPtySize(terminal.cols, terminal.rows);
         // fit() is a no-op when the row/column count stays the same. A forced
         // redraw is still needed after the WebView backing scale changes.
         if (terminal.rows > 0) terminal.refresh(0, terminal.rows - 1);
@@ -135,6 +149,13 @@
     };
     scheduleFitRef = scheduleFit;
     const observer = new ResizeObserver(scheduleFit);
+    const handleWindowFocus = (): void => {
+      // Another focused window may have changed this shared PTY while this
+      // pane was inactive, so reclaim ownership even when its size is equal
+      // to the last size reported from this pane.
+      lastSyncedSize = '';
+      scheduleFit();
+    };
     let resolutionQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
     const handleResolutionChange = (): void => {
       resolutionQuery.removeEventListener('change', handleResolutionChange);
@@ -144,7 +165,7 @@
     };
     observer.observe(container);
     window.addEventListener('resize', scheduleFit);
-    window.addEventListener('focus', scheduleFit);
+    window.addEventListener('focus', handleWindowFocus);
     window.visualViewport?.addEventListener('resize', scheduleFit);
     resolutionQuery.addEventListener('change', handleResolutionChange);
     scheduleFit();
@@ -155,7 +176,7 @@
       scheduleFitRef = undefined;
       observer.disconnect();
       window.removeEventListener('resize', scheduleFit);
-      window.removeEventListener('focus', scheduleFit);
+      window.removeEventListener('focus', handleWindowFocus);
       window.visualViewport?.removeEventListener('resize', scheduleFit);
       resolutionQuery.removeEventListener('change', handleResolutionChange);
       removeHangulImeAdapter();
@@ -188,5 +209,6 @@
      and caused bottom-anchored choice prompts to overlap their content. */
   .terminal-host { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: #0b100d; }
   :global(.xterm) { width: 100%; height: 100%; padding: 0 0 11px; }
-  :global(.xterm-viewport) { scrollbar-color: #34413999 transparent; scrollbar-width: thin; }
+  /* xterm.css paints the viewport #000, which shows through the bottom padding. */
+  :global(.xterm .xterm-viewport) { background-color: #0b100d; scrollbar-color: #34413999 transparent; scrollbar-width: thin; }
 </style>

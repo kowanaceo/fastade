@@ -1,6 +1,6 @@
 [package]
 name = "fastade-desktop"
-version = "0.2.0"
+version = "0.2.2"
 description = "Multi AI CLI desktop client"
 edition = "2021"
 rust-version = "1.88"
@@ -29,6 +29,10 @@ toml_edit = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSNotification", "NSOperation", "NSString", "NSGeometry", "NSArray", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSScreen", "NSApplication", "NSResponder", "NSGraphics", "NSView"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
