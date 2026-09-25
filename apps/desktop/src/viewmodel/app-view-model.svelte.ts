@@ -39,8 +39,11 @@ interface ShellInputActions { launchedAgent: CliKind | null; }
 // tools print alongside a busy spinner.
 const BUSY_PATTERN = /[⠀-⣿]|(?:esc|ctrl\+c) to interrupt|↑\s*\d|thinking…|generating…|running…|working(?:…|\s*\()|combobulating|reticulating/i;
 // Confirmation/approval prompts, which always mean the agent is blocked on
-// the user regardless of how recently output arrived.
-const WAITING_PATTERN = /\(y\/n\)|\[y\/n\]|do you want to (proceed|continue|allow)|press enter to continue|approve this|allow this (command|tool|action)|grant (access|permission)|❤ waiting for/i;
+// the user regardless of how recently output arrived. Selection menus (e.g.
+// Claude Code's AskUserQuestion footer "Enter to select · ↑/↓ to navigate")
+// count too: remote SSH sessions have no lifecycle hooks, so this text is the
+// only signal that the agent is waiting on a choice.
+const WAITING_PATTERN = /\(y\/n\)|\[y\/n\]|do you want to (proceed|continue|allow)|press enter to (continue|confirm)|enter to select · ↑\/↓ to navigate|approve this|allow this (command|tool|action)|grant (access|permission)|❤ waiting for/i;
 // Codex keeps "context left" and "? for shortcuts" visible while it is
 // working too, so neither is an idle signal. The completed-turn summary is
 // specific to the point at which the composer becomes ready again.
@@ -205,7 +208,10 @@ export class AppViewModel {
     // stale idle notification left over from the previous turn; otherwise a
     // newly working agent remains green until another lifecycle hook happens
     // to replace that stored idle value.
-    if (reported === 'waiting' || observed === 'waiting') return 'waiting';
+    // The PTY waiting cue is only a fallback for sessions without hooks
+    // (e.g. remote SSH): an agent's own reply can quote prompt text such as
+    // "Enter to select", which must not override a hook's `idle`.
+    if (reported === 'waiting' || (reported === undefined && observed === 'waiting')) return 'waiting';
     if (reported === 'working' || observed === 'working') return 'working';
     return 'idle';
   }
@@ -267,7 +273,10 @@ export class AppViewModel {
         projectPath: session.projectPath,
         status: session.status,
         cli: session.cli,
-        activity: this.activityFor(session.id),
+        // A stopped session keeps its last `cli` so a pinned one can resume
+        // that agent, but no agent is live in it: show the plain (grey)
+        // status dot instead of the agent's green "ready" state.
+        activity: session.status === 'running' ? this.activityFor(session.id) : undefined,
       });
     }
     for (const profile of this.savedSessions) {
@@ -580,6 +589,7 @@ export class AppViewModel {
         projectPath: path,
       });
       this.sessions = [created, ...this.sessions];
+      void this.syncSessionStatuses();
       if (targetGroupId !== UNGROUPED_ID) {
         const profile = await this.ensureProfile(created);
         this.sessionGroupIds = { ...this.sessionGroupIds, [created.id]: targetGroupId };
@@ -836,6 +846,7 @@ export class AppViewModel {
         if (saved.status !== 'running') {
           restored = await this.client.reconnectSession(saved.id);
           this.sessions = this.sessions.map((session) => session.id === saved.id ? restored : session);
+          void this.syncSessionStatuses();
         }
         if (!restored.cli) {
           this.installShellHook(saved.id);
@@ -955,9 +966,42 @@ export class AppViewModel {
     try {
       const reconnected = await this.client.reconnectSession(sessionId);
       this.sessions = this.sessions.map((session) => session.id === sessionId ? reconnected : session);
+      void this.syncSessionStatuses();
       this.installShellHook(sessionId);
       this.selectSession(sessionId);
-    } catch (error) { this.error = this.message(error); }
+    } catch (error) {
+      this.error = this.message(error);
+      void this.syncSessionStatuses();
+    }
+  }
+
+  /** Reconciles session rows with the backend, which owns every PTY. A
+   * terminal that exits immediately (e.g. an unreachable SSH host) emits its
+   * exit event before the create/reconnect call returns; that event finds no
+   * row (or is overwritten by the call's `running` result), which would leave
+   * a dead session showing green. Sessions the backend no longer knows are
+   * dropped for the same reason. */
+  async syncSessionStatuses(): Promise<void> {
+    try {
+      const backend = new Map((await this.client.listSessions()).map((session) => [session.id, session]));
+      const stale = this.sessions.filter((session) => !backend.has(session.id)).map((session) => session.id);
+      const changed = this.sessions.some((session) => backend.get(session.id)?.status !== session.status);
+      if (!stale.length && !changed) return;
+      this.sessions = this.sessions.flatMap((session) => {
+        const current = backend.get(session.id);
+        if (!current) return [];
+        if (current.status === session.status) return [session];
+        if (current.status !== 'running') this.clearAgentActivity(session.id);
+        return [{ ...session, status: current.status }];
+      });
+      for (const sessionId of stale) {
+        this.hookInstalledSessionIds.delete(sessionId);
+        this.clearAgentActivity(sessionId);
+      }
+      if (this.selectedSessionId && !backend.has(this.selectedSessionId)) this.selectedSessionId = this.sessions[0]?.id ?? null;
+    } catch {
+      // Best effort: the next exit event or sync corrects the rows.
+    }
   }
 
   async closeSession(sessionId: string): Promise<void> {

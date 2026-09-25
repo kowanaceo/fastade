@@ -13,7 +13,7 @@ fn main() {
         // status update, then exit immediately so the hook never blocks the
         // CLI it's attached to.
         let state = args.get(2).map(String::as_str).unwrap_or("idle");
-        report_activity(state);
+        report_activity(hook_state(state));
         // Codex Stop/Interrupt hooks require successful command hooks to
         // return a JSON object. An empty object is also harmless for Claude
         // hooks and for Codex's legacy `notify` callback.
@@ -92,6 +92,35 @@ fn call_tool(params: Value) -> Result<Value, Value> {
     let response =
         send_to_app(&request).map_err(|error| json!({ "code": -32000, "message": error }))?;
     Ok(json!({ "content": [{ "type": "text", "text": response.to_string() }] }))
+}
+
+/// Claude Code's AskUserQuestion arrives as an ordinary PreToolUse (mapped to
+/// `working`), yet it blocks on the user exactly like a permission prompt.
+/// The hook payload on stdin names the tool, so promote that one to
+/// `waiting`. stdin is only read for `working` hooks and never from a
+/// terminal, so a manual run or Codex's `notify` callback cannot block here.
+fn hook_state(state: &str) -> &str {
+    use std::io::{IsTerminal, Read};
+
+    if state != "working" || io::stdin().is_terminal() {
+        return state;
+    }
+    let mut payload = String::new();
+    if io::stdin().take(1 << 20).read_to_string(&mut payload).is_err() {
+        return state;
+    }
+    let tool = serde_json::from_str::<Value>(&payload)
+        .ok()
+        .and_then(|value| value.get("tool_name")?.as_str().map(str::to_owned));
+    if is_user_question_tool(tool.as_deref()) {
+        "waiting"
+    } else {
+        state
+    }
+}
+
+fn is_user_question_tool(tool: Option<&str>) -> bool {
+    tool == Some("AskUserQuestion")
 }
 
 /// Silently does nothing if `$FASTADE_SESSION_ID` is unset (not run inside a

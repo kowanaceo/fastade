@@ -199,6 +199,10 @@
     if (sessionId) void viewModel.moveSessionToGroup(sessionId, viewModel.selectedGroupId);
   }
 
+  // Another window (a popped-out session) can close or restart sessions;
+  // re-check the backend whenever this window comes back to the front.
+  const syncSessionStatuses = (): void => { void viewModel.syncSessionStatuses(); };
+
   onMount(() => {
     let disposed = false;
     let terminalLayoutFrame = 0;
@@ -218,6 +222,7 @@
     window.addEventListener('keydown', handleGlobalKeydown, { capture: true });
     window.addEventListener('click', closeContextMenus);
     window.addEventListener('contextmenu', handleGlobalContextMenu, { capture: true });
+    window.addEventListener('focus', syncSessionStatuses);
     void viewModel.load({ auxiliaryWindow: Boolean(poppedSessionId) });
     return () => {
       disposed = true;
@@ -226,6 +231,7 @@
       window.removeEventListener('keydown', handleGlobalKeydown, { capture: true });
       window.removeEventListener('click', closeContextMenus);
       window.removeEventListener('contextmenu', handleGlobalContextMenu, { capture: true });
+      window.removeEventListener('focus', syncSessionStatuses);
       viewModel.dispose();
     };
   });

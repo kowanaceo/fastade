@@ -68,6 +68,12 @@
       terminal.write(data, () => { replayWrites -= 1; });
     });
     const input = terminal.onData((data) => {
+      // Focus reports (DECSET 1004) fire whenever the user switches to another
+      // session pane. Claude Code pauses its spinner while unfocused, and that
+      // output silence would read as idle, so a still-working agent turned
+      // green as soon as it was not the pane being watched. Every pane stays
+      // "focused" from the agent's point of view instead.
+      if (data === '\x1b[I' || data === '\x1b[O') return;
       // xterm emits replies to OSC color, cursor-position, and device-attribute
       // queries through onData. Queries in a historical transcript must not
       // inject those replies into the live shell when the pane is mounted.
