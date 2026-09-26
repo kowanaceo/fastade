@@ -10,6 +10,7 @@
     "dev": "vite --config apps/desktop/vite.config.ts",
     "build": "vite build --config apps/desktop/vite.config.ts",
     "check": "svelte-check --tsconfig apps/desktop/tsconfig.json",
+    "test:activity": "node --experimental-strip-types --test apps/desktop/src/viewmodel/activity-detector.test.ts",
     "tauri": "tauri",
     "tauri:dev": "tauri dev --config apps/desktop/src-tauri/tauri.conf.json",
     "tauri:build": "tauri build --config apps/desktop/src-tauri/tauri.conf.json"

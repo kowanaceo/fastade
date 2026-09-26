@@ -447,6 +447,7 @@
               onInterrupt={(id) => void viewModel.interruptSession(id)}
               onFocus={(id) => viewModel.selectSession(id)}
               onCurrentDirectory={(id, path) => viewModel.updateCurrentDirectory(id, path)}
+              onActivityScreen={(id, screen) => viewModel.observeAgentScreen(id, screen)}
             />
           </article>
         {/each}

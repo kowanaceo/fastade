@@ -1,5 +1,6 @@
 import type { DesktopClient, SshHost, TerminalEvent } from '../application/desktop-client';
 import { type AgentUsage, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type UpdateServerInput, type WebAgent } from '../domain/session';
+import { detectAgentActivity, type AgentActivity } from './activity-detector';
 
 type TerminalSink = (data: string, replay?: boolean) => void;
 
@@ -23,55 +24,14 @@ export interface SessionGroupEntry {
   activity?: AgentActivity;
 }
 
-/** Heuristic classification of what a running agent is doing right now,
- * inferred from its raw PTY output — never a value the CLI reports itself.
+/** Classification of what a running agent is doing right now, sourced from a
+ * CLI lifecycle hook when available and otherwise from its rendered screen.
  * `working`: actively producing output (spinner frames, "esc to interrupt").
  * `waiting`: an approval/confirmation prompt requires the user's attention.
  * `idle`: the agent is at its composer with no work in progress, or no agent
  * is running in this session's shell right now. */
-export type AgentActivity = 'working' | 'waiting' | 'idle';
-
 interface GroupDefinition { id: string; name: string; }
 interface ShellInputActions { launchedAgent: CliKind | null; }
-
-// Spinner frames used by ora-style CLI progress indicators (Codex, Claude
-// Code, Gemini CLI all use Braille-pattern spinners) plus the phrases these
-// tools print alongside a busy spinner.
-const BUSY_PATTERN = /[⠀-⣿]|(?:esc|ctrl\+c) to interrupt|↑\s*\d|thinking…|generating…|running…|working(?:…|\s*\()|combobulating|reticulating/i;
-// Confirmation/approval prompts, which always mean the agent is blocked on
-// the user regardless of how recently output arrived. Selection menus (e.g.
-// Claude Code's AskUserQuestion footer "Enter to select · ↑/↓ to navigate")
-// count too: remote SSH sessions have no lifecycle hooks, so this text is the
-// only signal that the agent is waiting on a choice.
-const WAITING_PATTERN = /\(y\/n\)|\[y\/n\]|do you want to (proceed|continue|allow)|press enter to (continue|confirm)|enter to select · ↑\/↓ to navigate|approve this|allow this (command|tool|action)|grant (access|permission)|❤ waiting for/i;
-// Codex keeps "context left" and "? for shortcuts" visible while it is
-// working too, so neither is an idle signal. The completed-turn summary is
-// specific to the point at which the composer becomes ready again.
-const CODEX_IDLE_PATTERN = /\bworked for\b[^\r\n]*\b(?:done|completed)\b/i;
-// If a working agent produces no output at all for this long, assume it
-// finished its turn and is now idling on an input prompt.
-const AGENT_IDLE_TIMEOUT_MS = 1800;
-// How much recent printable PTY output to keep per session for cue ordering.
-const ACTIVITY_TAIL_CHARS = 4000;
-
-/** Removes terminal protocol/control bytes while retaining the text the TUI
- * painted. Codex emits cursor and device-status traffic even on an idle
- * composer; those bytes must not count as active work. */
-function printableTerminalText(value: string): string {
-  return value
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
-    .replace(/\x1b[P^_][\s\S]*?\x1b\\/g, '')
-    .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '')
-    .replace(/\x1b[@-_]/g, '')
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
-}
-
-function lastPatternIndex(value: string, pattern: RegExp): number {
-  const matches = value.matchAll(new RegExp(pattern.source, `${pattern.flags.replace('g', '')}g`));
-  let last = -1;
-  for (const match of matches) last = match.index;
-  return last;
-}
 
 const UNGROUPED_ID = 'ungrouped';
 const DEFAULT_GROUP_NAME = 'Sessions';
@@ -152,10 +112,6 @@ export class AppViewModel {
   private readonly terminalSinks = new Map<string, Set<TerminalSink>>();
   private readonly terminalWrites = new Map<string, Promise<void>>();
   private readonly hookInstalledSessionIds = new Set<string>();
-  /** Recent raw PTY bytes per session, used only to scan for activity cues
-   * (spinners, prompts) — separate from the terminal's own scrollback. */
-  private readonly activityTails = new Map<string, string>();
-  private readonly activityIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** First directory each shell reported after opening at `~` — the device's
    * real home path (e.g. /root), so it can be told apart from a chosen folder. */
   private readonly shellHomes = new Map<string, string>();
@@ -357,9 +313,6 @@ export class AppViewModel {
     this.terminalSinks.clear();
     this.terminalWrites.clear();
     this.contextWrites.clear();
-    for (const timer of this.activityIdleTimers.values()) clearTimeout(timer);
-    this.activityIdleTimers.clear();
-    this.activityTails.clear();
     if (this.usageTimer) clearInterval(this.usageTimer);
     this.usageTimer = undefined;
     if (this.memoryTimer) clearInterval(this.memoryTimer);
@@ -898,9 +851,6 @@ export class AppViewModel {
     this.terminalSinks.set(sessionId, sinks);
     void this.client.terminalSnapshot(sessionId).then((snapshot) => {
       if (sinks.has(sink) && snapshot) {
-        // Reclassify an already-running agent after an app reload. Live PTY
-        // events emitted while no window was attached are only in this snapshot.
-        this.observeAgentOutput(sessionId, snapshot);
         // A raw transcript can contain terminal capability queries emitted by
         // an earlier CLI. Mark it as replay so xterm's generated replies are
         // rendered but are not sent into the currently running PTY as input.
@@ -921,10 +871,8 @@ export class AppViewModel {
     // especially useful for Codex, whose full-screen TUI can redraw the idle
     // composer before its first busy frame arrives.
     if (sessionId in this.runningAgents && /[\r\n]/.test(data)) {
-      this.activityTails.delete(sessionId);
       this.clearActivityOverride(sessionId);
       this.setAgentActivity(sessionId, 'working');
-      this.armIdleTimer(sessionId);
     }
     // Browser input and the WebKit Hangul adapter can emit adjacent chunks in
     // the same event turn. Serialize IPC writes so committed text always reaches
@@ -1064,12 +1012,17 @@ export class AppViewModel {
   private handleTerminalEvent(event: TerminalEvent): void {
     if (event.kind === 'output') {
       this.terminalSinks.get(event.sessionId)?.forEach((sink) => sink(event.content));
-      this.observeAgentOutput(event.sessionId, event.content);
       return;
     }
     if (event.kind === 'activity') {
       if (event.content !== 'working' && event.content !== 'waiting' && event.content !== 'idle') return;
       this.activityOverrides = { ...this.activityOverrides, [event.sessionId]: event.content };
+      // Keep the PTY-text heuristic in lockstep with the hook's ground truth.
+      // Without this, a stale `observed` "working" left over from mid-turn
+      // spinner text can outlive the hook's own "idle" report forever — the
+      // agent's final screen often matches neither the working nor the idle
+      // regex, so the heuristic alone never claws its way back down.
+      this.setAgentActivity(event.sessionId, event.content);
       if (!(event.sessionId in this.runningAgents)) {
         const session = this.sessions.find((item) => item.id === event.sessionId);
         if (session?.cli) this.runningAgents = { ...this.runningAgents, [event.sessionId]: session.cli };
@@ -1084,53 +1037,13 @@ export class AppViewModel {
     this.clearAgentActivity(event.sessionId);
   }
 
-  /** Heuristic-only: classifies what a running agent is doing from its raw
-   * PTY bytes. Never treated as ground truth — just a hint for the UI badge. */
-  private observeAgentOutput(sessionId: string, chunk: string): void {
+  /** Hookless sessions (notably remote SSH) are classified from the current
+   * rendered screen. No explicit cue means the previous state is retained. */
+  observeAgentScreen(sessionId: string, screen: string): void {
     if (!(sessionId in this.runningAgents)) return;
-    const printable = printableTerminalText(chunk);
-    // Device-status replies, cursor moves, title changes, etc. are terminal
-    // housekeeping, not evidence that the agent is still generating.
-    if (!/\S/.test(printable)) return;
-    const tail = ((this.activityTails.get(sessionId) ?? '') + printable).slice(-ACTIVITY_TAIL_CHARS);
-    this.activityTails.set(sessionId, tail);
-
     const cli = this.runningAgents[sessionId];
-    const waitingIndex = lastPatternIndex(tail, WAITING_PATTERN);
-    const idleIndex = cli === 'codex' ? lastPatternIndex(tail, CODEX_IDLE_PATTERN) : -1;
-    const busyIndex = lastPatternIndex(tail, BUSY_PATTERN);
-    // Full-screen TUIs repaint old and new states into the same PTY chunk.
-    // Whichever explicit cue was painted last represents the current screen.
-    if (waitingIndex > busyIndex) {
-      this.setAgentActivity(sessionId, 'waiting');
-      this.clearIdleTimer(sessionId);
-      return;
-    }
-    if (idleIndex > busyIndex) {
-      this.setAgentActivity(sessionId, 'idle');
-      this.clearIdleTimer(sessionId);
-      return;
-    }
-    this.setAgentActivity(sessionId, 'working');
-    this.armIdleTimer(sessionId);
-  }
-
-  /** No output at all for AGENT_IDLE_TIMEOUT_MS while an agent is running
-   * almost always means it finished its response and returned to its idle
-   * composer, even when the prompt has no distinctive text. */
-  private armIdleTimer(sessionId: string): void {
-    this.clearIdleTimer(sessionId);
-    const timer = setTimeout(() => {
-      this.activityIdleTimers.delete(sessionId);
-      if (sessionId in this.runningAgents) this.setAgentActivity(sessionId, 'idle');
-    }, AGENT_IDLE_TIMEOUT_MS);
-    this.activityIdleTimers.set(sessionId, timer);
-  }
-
-  private clearIdleTimer(sessionId: string): void {
-    const timer = this.activityIdleTimers.get(sessionId);
-    if (timer) clearTimeout(timer);
-    this.activityIdleTimers.delete(sessionId);
+    const activity = detectAgentActivity(cli, screen);
+    if (activity) this.setAgentActivity(sessionId, activity);
   }
 
   private setAgentActivity(sessionId: string, activity: AgentActivity): void {
@@ -1139,8 +1052,6 @@ export class AppViewModel {
   }
 
   private clearAgentActivity(sessionId: string): void {
-    this.clearIdleTimer(sessionId);
-    this.activityTails.delete(sessionId);
     if (!(sessionId in this.agentActivity)) return;
     const next = { ...this.agentActivity };
     delete next[sessionId];
@@ -1159,16 +1070,11 @@ export class AppViewModel {
   }
 
   private restoreRunningAgentState(sessions: CliSessionSummary[]): void {
-    for (const timer of this.activityIdleTimers.values()) clearTimeout(timer);
-    this.activityIdleTimers.clear();
-    this.activityTails.clear();
-
     const running = sessions.filter(
       (session): session is CliSessionSummary & { cli: CliKind } => session.status === 'running' && Boolean(session.cli),
     );
     this.runningAgents = Object.fromEntries(running.map((session) => [session.id, session.cli]));
     this.agentActivity = Object.fromEntries(running.map((session) => [session.id, 'working' as const]));
-    for (const session of running) this.armIdleTimer(session.id);
   }
 
   private matchesProfile(session: CliSessionSummary, profile: SavedSessionProfile): boolean {
@@ -1352,9 +1258,7 @@ export class AppViewModel {
   private async markAgentRunning(sessionId: string, cli: CliKind, model?: string): Promise<void> {
     this.runningAgents = { ...this.runningAgents, [sessionId]: cli };
     this.shellInputBuffers.delete(sessionId);
-    this.activityTails.delete(sessionId);
     this.setAgentActivity(sessionId, 'working');
-    this.armIdleTimer(sessionId);
     try {
       const updated = await this.client.updateSessionAgent(sessionId, cli, model);
       this.sessions = this.sessions.map((item) => item.id === sessionId ? { ...item, cli: updated.cli, model: updated.model } : item);

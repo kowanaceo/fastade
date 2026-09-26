@@ -12,6 +12,7 @@
   export let onInterrupt: (sessionId: string) => void;
   export let onFocus: (sessionId: string) => void;
   export let onCurrentDirectory: (sessionId: string, path: string) => void;
+  export let onActivityScreen: (sessionId: string, screen: string) => void;
   export let fontSize = 11;
   export let layoutRevision = 0;
 
@@ -37,6 +38,10 @@
       fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Apple SD Gothic Neo", "Noto Sans Mono CJK KR", monospace',
       fontSize,
       lineHeight: 1.15,
+      // Full-screen terminal apps enable mouse reporting, which otherwise
+      // turns every drag into input for the remote app. Keep normal drags
+      // unchanged, but let macOS users hold Option to force text selection.
+      macOptionClickForcesSelection: true,
       overviewRuler: { width: 5 },
       scrollback: 5000,
       theme: {
@@ -54,6 +59,16 @@
     fitRef = fit;
     terminal.loadAddon(fit);
     terminal.open(container);
+    const reportActivityScreen = (): void => {
+      const buffer = terminal.buffer.active;
+      const end = buffer.baseY + terminal.rows;
+      const start = Math.max(buffer.baseY, end - 16);
+      const lines: string[] = [];
+      for (let index = start; index < end; index += 1) {
+        lines.push(buffer.getLine(index)?.translateToString(true) ?? '');
+      }
+      onActivityScreen(sessionId, lines.join('\n'));
+    };
     const removeHangulImeAdapter = installWebKitHangulImeAdapter(
       terminal,
       (data) => onInput(sessionId, data),
@@ -61,11 +76,14 @@
     let replayWrites = 0;
     const unregister = registerOutput(sessionId, (data, replay = false) => {
       if (!replay) {
-        terminal.write(data);
+        terminal.write(data, reportActivityScreen);
         return;
       }
       replayWrites += 1;
-      terminal.write(data, () => { replayWrites -= 1; });
+      terminal.write(data, () => {
+        replayWrites -= 1;
+        reportActivityScreen();
+      });
     });
     const input = terminal.onData((data) => {
       // Focus reports (DECSET 1004) fire whenever the user switches to another
@@ -116,6 +134,16 @@
       syncPtySize(cols, rows);
     });
     terminal.attachCustomKeyEventHandler((event) => {
+      if (event.type === 'keydown' && event.metaKey && event.key.toLowerCase() === 'c'
+        && terminal.hasSelection()) {
+        // WKWebView does not consistently dispatch its native copy command to
+        // xterm's synthetic selection. Write it to the local clipboard from
+        // the keyboard gesture instead; Ctrl+C remains terminal interrupt.
+        event.preventDefault();
+        event.stopPropagation();
+        void navigator.clipboard.writeText(terminal.getSelection());
+        return false;
+      }
       if (event.key !== 'Escape' || event.type !== 'keydown') return true;
       event.preventDefault();
       event.stopPropagation();
