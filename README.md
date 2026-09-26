@@ -89,6 +89,10 @@ npm run tauri:build
 
 기본 로컬 빌드는 Apple Developer ID로 서명·공증되지 않습니다. 다른 Mac에 배포하려면 [Tauri의 macOS 코드 서명 안내](https://v2.tauri.app/distribute/sign/macos/)에 따라 Developer ID 인증서로 서명하고 공증해야 합니다.
 
+## 사용 가이드
+
+단축키와 핵심 기능은 사용 가이드를 참고하세요: [한국어](docs/USAGE.ko.md) · [English](docs/USAGE.en.md)
+
 ## 주요 기능
 
 - 로컬 또는 SSH 서버의 터미널 세션 생성·복원·관리
