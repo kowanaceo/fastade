@@ -16,10 +16,14 @@
     waiting: 'Needs you — approval or confirmation required',
     idle: 'Ready — no work in progress',
   };
+  // A `failed` session (its shell process died — most commonly an SSH
+  // session losing its network connection) stays visible with a resume
+  // affordance instead of vanishing; only an explicitly `completed` shell
+  // (the user typed `exit`) drops out of the grid on its own.
   const visibleSessions = $derived(
     poppedSessionId
       ? viewModel.sessions.filter((session) => session.id === poppedSessionId)
-      : (viewModel.selectedGroup?.sessions ?? []).filter((session) => session.status === 'running'),
+      : (viewModel.selectedGroup?.sessions ?? []).filter((session) => session.status !== 'completed'),
   );
   // Keep every live terminal mounted while switching groups. Recreating an
   // xterm from a truncated raw PTY transcript cannot reconstruct a full-screen
@@ -27,7 +31,7 @@
   const renderedSessions = $derived(
     poppedSessionId
       ? visibleSessions
-      : viewModel.sessions.filter((session) => session.status === 'running'),
+      : viewModel.sessions.filter((session) => session.status !== 'completed'),
   );
   let sessionMenu = $state<{ sessionId: string; x: number; y: number } | null>(null);
   let groupMenu = $state<{ groupId: string; groupName: string; x: number; y: number } | null>(null);
@@ -432,8 +436,11 @@
                 {/if}</div>
               <div class="card-actions">
                 {#if !poppedSessionId}<button title="New window" onclick={(event) => { event.stopPropagation(); void viewModel.popOut(session.id); }}>↗</button>{/if}
-                {#if session.status !== 'running'}<button class="reconnect" title="Reconnect" aria-label={`Reconnect ${session.title}`} onclick={(event) => { event.stopPropagation(); void viewModel.reconnectSession(session.id); }}>↻</button>{/if}
-                <button class="stop" title="Exit AI agent and return to shell" onclick={(event) => { event.stopPropagation(); void viewModel.exitAgent(session.id); }}>■</button>
+                {#if session.status === 'running'}
+                  <button class="stop" title="Exit AI agent and return to shell" onclick={(event) => { event.stopPropagation(); void viewModel.exitAgent(session.id); }}>■</button>
+                {:else}
+                  <button class="resume" title="Resume this session" aria-label={`Resume ${session.title}`} onclick={(event) => { event.stopPropagation(); void viewModel.reconnectSession(session.id); }}>⟳ Resume</button>
+                {/if}
                 <button class="close" title="Close session" onclick={(event) => { event.stopPropagation(); void viewModel.closeSession(session.id); }}>×</button>
               </div>
             </header>
@@ -449,6 +456,12 @@
               onCurrentDirectory={(id, path) => viewModel.updateCurrentDirectory(id, path)}
               onActivityScreen={(id, screen) => viewModel.observeAgentScreen(id, screen)}
             />
+            {#if session.status !== 'running'}
+              <div class="disconnected-banner" role="alert">
+                <span>Disconnected — {session.endpoint === 'local' ? 'the shell exited unexpectedly.' : `the connection to ${viewModel.endpointLabel(session.endpoint)} was lost.`}</span>
+                <button onclick={(event) => { event.stopPropagation(); void viewModel.reconnectSession(session.id); }}>Resume</button>
+              </div>
+            {/if}
           </article>
         {/each}
         {#if !visibleSessions.length}<div role="group" aria-label="Active group sessions" class="empty group-empty" ondragover={handleActiveGroupDragOver} ondrop={handleActiveGroupDrop}>No running sessions in this group.<small>Drop a session from the left to move it here.</small></div>{/if}
