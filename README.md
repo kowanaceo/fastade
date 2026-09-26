@@ -4,18 +4,90 @@ Codex CLI, Claude Code, Gemini CLI 세션을 한곳에서 실행하고 관리하
 
 > 이 프로젝트는 현재 초기 개발 단계입니다. 데이터 형식과 기능이 예고 없이 바뀔 수 있으며, 모바일의 실제 원격 세션 연결은 아직 완성되지 않았습니다.
 
-## 설치
+## 데스크톱 앱 빌드
 
-미리 빌드된 설치 파일은 제공하지 않습니다. 저장소를 내려받아 직접 빌드하세요.
+미리 빌드된 설치 파일은 제공하지 않습니다. Tauri의 데스크톱 번들은 플랫폼별 네이티브 도구를 사용하므로 Windows 설치 파일은 Windows에서, Linux 패키지는 Linux에서, macOS 앱은 macOS에서 빌드하세요. 아래 명령은 저장소 루트에서 실행합니다.
+
+공통 요구 사항은 다음과 같습니다.
+
+- [Git](https://git-scm.com/downloads)
+- Node.js 22.12 이상인 22.x 버전 또는 Node.js 24 이상과 npm
+- Rust 1.88 이상과 Cargo. [rustup](https://rustup.rs/)으로 stable toolchain을 설치하는 방식을 권장합니다.
+
+처음 한 번 저장소를 받고 JavaScript 의존성을 설치합니다. 잠금 파일과 동일한 버전을 설치하기 위해 `npm ci`를 사용합니다.
 
 ```bash
 git clone https://github.com/kowanaceo/fastade.git
 cd fastade
-npm install
+npm ci
+```
+
+### Windows
+
+1. [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)를 설치하면서 **Desktop development with C++** workload를 선택합니다.
+2. [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section)의 Evergreen Bootstrapper를 설치합니다. Windows 10(1803 이상)과 Windows 11에는 보통 이미 설치되어 있습니다.
+3. 새 PowerShell을 열고 저장소 루트에서 빌드합니다.
+
+```powershell
+rustup default stable-msvc
+npm run check
 npm run tauri:build
 ```
 
-macOS 빌드 결과물은 `apps/desktop/src-tauri/target/release/bundle/`에 생성됩니다. 빌드에 필요한 도구는 아래 요구 사항을 참고하세요.
+설치 파일은 다음 위치에 생성됩니다.
+
+- MSI: `apps\desktop\src-tauri\target\release\bundle\msi\`
+- NSIS 설치 프로그램(`.exe`): `apps\desktop\src-tauri\target\release\bundle\nsis\`
+
+현재 앱 자체는 Windows에서 빌드·실행할 수 있지만, MCP 브리지의 로컬 IPC는 Unix socket 기반이므로 Windows에서는 MCP 연동이 동작하지 않습니다.
+
+### Linux (Ubuntu/Debian)
+
+먼저 Tauri 2의 WebKitGTK 및 시스템 빌드 의존성을 설치합니다.
+
+```bash
+sudo apt update
+sudo apt install libwebkit2gtk-4.1-dev \
+  build-essential \
+  curl \
+  wget \
+  file \
+  libxdo-dev \
+  libssl-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev
+```
+
+그다음 저장소 루트에서 빌드합니다.
+
+```bash
+npm run check
+npm run tauri:build
+```
+
+패키지는 `apps/desktop/src-tauri/target/release/bundle/` 아래의 `deb/`, `rpm/`, `appimage/` 디렉터리에 생성됩니다. AppImage의 호환 범위는 빌드한 시스템의 glibc 버전에 영향을 받으므로 배포용 빌드는 지원하려는 가장 오래된 환경에서 수행하세요. Tauri는 Ubuntu 22.04 또는 Debian 12를 기준 환경의 예로 권장합니다. Fedora, Arch 등 다른 배포판의 의존성 명령은 [Tauri 2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux)를 참고하세요.
+
+### macOS
+
+데스크톱 앱만 빌드할 때는 전체 Xcode 대신 Xcode Command Line Tools만 설치해도 됩니다.
+
+```bash
+xcode-select --install
+```
+
+설치가 끝나면 저장소 루트에서 빌드합니다.
+
+```bash
+npm run check
+npm run tauri:build
+```
+
+결과물은 다음 위치에 생성됩니다.
+
+- 앱 번들: `apps/desktop/src-tauri/target/release/bundle/macos/fastade.app`
+- 디스크 이미지: `apps/desktop/src-tauri/target/release/bundle/dmg/`
+
+기본 로컬 빌드는 Apple Developer ID로 서명·공증되지 않습니다. 다른 Mac에 배포하려면 [Tauri의 macOS 코드 서명 안내](https://v2.tauri.app/distribute/sign/macos/)에 따라 Developer ID 인증서로 서명하고 공증해야 합니다.
 
 ## 주요 기능
 
@@ -26,11 +98,8 @@ macOS 빌드 결과물은 `apps/desktop/src-tauri/target/release/bundle/`에 생
 - 선택형 읽기 전용 MCP 연동을 통한 전체 세션 상태 조회
 - Flutter 모바일 클라이언트의 SSH 프로필 및 보안 저장소 지원
 
-## 요구 사항
+## 추가 요구 사항
 
-- Node.js 22.12 이상(또는 24 이상)과 npm
-- Rust 1.88 이상
-- 데스크톱 앱 빌드에 필요한 [Tauri 2 시스템 의존성](https://v2.tauri.app/start/prerequisites/)
 - 모바일 개발 시 Flutter SDK와 Android Studio 또는 Xcode
 - 사용할 AI CLI(Codex CLI, Claude Code, Gemini CLI)는 별도 설치 및 로그인이 필요합니다.
 
