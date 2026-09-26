@@ -82,6 +82,14 @@
       replayWrites += 1;
       terminal.write(data, () => {
         replayWrites -= 1;
+        // A replayed transcript can contain a mouse-tracking DECSET left on
+        // by a CLI that exited (or was killed) before it sent the matching
+        // DECRST. Applying that historical mode to this fresh xterm.js
+        // instance would turn every future mouse move over the pane into
+        // garbage "<35;4;19M"-style bytes fed into the now-plain shell —
+        // reset every mouse-reporting mode once replay settles, local only,
+        // never forwarded as input.
+        if (replayWrites === 0) terminal.write('\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l');
         reportActivityScreen();
       });
     });
