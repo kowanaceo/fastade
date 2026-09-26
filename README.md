@@ -1,8 +1,8 @@
 # fastade
 
-Codex CLI, Claude Code, Gemini CLI 세션을 한곳에서 실행하고 관리하기 위한 데스크톱·모바일 클라이언트입니다.
+Codex CLI, Claude Code, Gemini CLI 세션을 한곳에서 실행하고 관리하기 위한 데스크톱 클라이언트입니다.
 
-> 이 프로젝트는 현재 초기 개발 단계입니다. 데이터 형식과 기능이 예고 없이 바뀔 수 있으며, 모바일의 실제 원격 세션 연결은 아직 완성되지 않았습니다.
+> 이 프로젝트는 현재 초기 개발 단계입니다. 데이터 형식과 기능이 예고 없이 바뀔 수 있습니다.
 
 ## 데스크톱 앱 빌드
 
@@ -100,11 +100,9 @@ npm run tauri:build
 - 세션별 터미널 팝아웃과 작업 상태·메모리 사용량 표시
 - Codex와 Claude Code 사용량 조회
 - 선택형 읽기 전용 MCP 연동을 통한 전체 세션 상태 조회
-- Flutter 모바일 클라이언트의 SSH 프로필 및 보안 저장소 지원
 
 ## 추가 요구 사항
 
-- 모바일 개발 시 Flutter SDK와 Android Studio 또는 Xcode
 - 사용할 AI CLI(Codex CLI, Claude Code, Gemini CLI)는 별도 설치 및 로그인이 필요합니다.
 
 현재 MCP 브리지의 로컬 IPC는 macOS와 Linux에서만 동작합니다. Windows용 named pipe 지원은 아직 구현되지 않았습니다.
@@ -125,18 +123,6 @@ npm run tauri:build
 
 브라우저 단독 실행은 지원하지 않습니다. 프런트엔드는 Tauri IPC를 통해 Rust host와 통신하므로 `npm run tauri:dev`로 실행해야 합니다.
 
-## 모바일 개발
-
-```bash
-cd apps/mobile
-flutter pub get
-flutter analyze
-flutter test
-flutter run
-```
-
-모바일 앱은 CLI를 직접 실행하지 않고 SSH로 데스크톱에 접속하도록 설계되어 있습니다. SSH 프로필, OS 보안 저장소의 암호 보관, host key 최초 승인 및 변경 차단, 원격 세션 UI까지 구현되어 있으며 `fastade host --stdio` 브리지는 아직 개발 중입니다.
-
 ## AI CLI 연동과 보안
 
 설정에서 MCP 연동을 켜면 fastade는 해당 CLI의 사용자 설정 파일에 `fastade_mcp` 항목을 추가합니다.
@@ -155,7 +141,6 @@ SSH 비밀번호는 OS 보안 저장소에 저장됩니다. 저장소에 인증�
 
 ```text
 apps/desktop/  Svelte 5 + TypeScript + Tauri 2 데스크톱 앱
-apps/mobile/   Flutter 모바일 앱
 SPEC.md        제품 및 UX 명세
 ```
 
@@ -164,7 +149,6 @@ SPEC.md        제품 및 UX 명세
 ```bash
 npm run check
 cd apps/desktop/src-tauri && cargo test
-cd apps/mobile && flutter analyze && flutter test
 ```
 
 ## 기여

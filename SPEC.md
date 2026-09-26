@@ -2,22 +2,20 @@
 
 - 문서 상태: Draft v0.1
 - 작성일: 2026-09-15
-- 대상 플랫폼: macOS, Windows, Linux, iOS, Android
+- 대상 플랫폼: macOS, Windows, Linux
 - 데스크톱: Tauri 2 + Rust
-- 모바일: Flutter
 
 ## 1. 제품 정의
 
-fastade는 Codex CLI, Gemini CLI, Claude Code를 한 인터페이스에서 실행하고, 세션·권한·프로젝트·사용량을 통합 관리하는 멀티플랫폼 클라이언트다.
+fastade는 Codex CLI, Gemini CLI, Claude Code를 한 인터페이스에서 실행하고, 세션·권한·프로젝트·사용량을 통합 관리하는 데스크톱 클라이언트다.
 
-데스크톱 앱은 사용자 컴퓨터에서 실제 CLI 프로세스를 실행하는 **호스트**다. 모바일 앱은 데스크톱 호스트에 안전하게 연결하여 세션을 조회·제어하는 **컴패니언**이다. 모바일 OS 제약상 iOS/Android에서 임의의 AI CLI 바이너리를 직접 실행하는 기능은 MVP 범위에 포함하지 않는다.
+데스크톱 앱은 로컬 또는 SSH 원격 서버에서 실제 CLI 프로세스를 실행하고 세션을 관리한다.
 
 ### 1.1 목표
 
 - 하나의 앱에서 여러 AI CLI를 등록, 실행, 전환한다.
 - 각 AI CLI의 원래 대화형 기능과 화면을 PTY 터미널로 손실 없이 제공한다.
 - 여러 프로젝트와 여러 동시 세션을 안전하게 관리한다.
-- 모바일에서 진행 상황 확인, 메시지 전송, 권한 승인/거부, 중단을 수행한다.
 - CLI가 추가되어도 앱 본체 변경을 최소화하는 어댑터 구조를 제공한다.
 - 로컬 우선(local-first)으로 동작하고 사용자의 코드와 자격 증명을 외부 중계 서버에 저장하지 않는다.
 
@@ -26,7 +24,6 @@ fastade는 Codex CLI, Gemini CLI, Claude Code를 한 인터페이스에서 실�
 ### 2.1 대상 사용자
 
 - 둘 이상의 AI 코딩 CLI를 프로젝트별로 병행하는 개발자
-- 장시간 실행되는 에이전트 작업을 자리 밖에서 확인하려는 사용자
 - CLI별 승인 요청과 결과물을 한곳에서 관리하려는 팀 또는 개인
 
 ### 2.2 핵심 사용자 흐름
@@ -37,7 +34,6 @@ fastade는 Codex CLI, Gemini CLI, Claude Code를 한 인터페이스에서 실�
 4. 사용자는 CLI 원래 터미널에서 대화, slash command, 승인 요청과 도구 실행을 그대로 사용한다. ■ 를 누르면 agent가 종료되고 shell로 돌아온다.
 5. 앱을 닫았다 다시 열어도 세션 이력과 메타데이터가 복원된다.
 6. pin된 프로젝트를 누르면 저장된 server의 저장된 folder에서 바로 shell이 열린다.
-7. 모바일에서 원격 server(SSH)를 등록한 뒤 원격 상태 확인, 입력, 승인/거부, 중단을 수행한다. 모바일은 로컬 실행이 없으므로 server 목록 중 SSH 대상만 선택할 수 있다.
 
 ## 3. MVP 범위
 
@@ -50,12 +46,10 @@ fastade는 Codex CLI, Gemini CLI, Claude Code를 한 인터페이스에서 실�
 - CLI별 PTY 원본 스트림과 터미널 scrollback 보존
 - 승인 요청 표시 및 승인/거부
 - 파일 변경 요약과 diff 열람
-- 모바일 SSH 호스트 등록, 세션 목록/상세, 메시지 전송, 승인/거부, 중단
 - 로컬 SQLite 저장소, OS 보안 저장소 기반 비밀 관리
 - 앱/CLI 오류 진단 번들 생성(비밀 자동 마스킹)
 - 병렬 세션, 세션 복제 및 CLI 간 컨텍스트 전달
 - SSH 원격 호스트
-- 푸시 알림
 - 음성 입력, 이미지/파일 첨부
 - 플러그인 SDK 및 커뮤니티 어댑터
 - 비용 예산과 사용량 대시보드
@@ -64,24 +58,19 @@ fastade는 Codex CLI, Gemini CLI, Claude Code를 한 인터페이스에서 실�
 ## 4. 시스템 아키텍처
 
 ```text
-Desktop UI (Tauri WebView)             Mobile UI (Flutter)
-          | Tauri IPC                         | SSH channel
-          v                                   v
-+------------------+                   +------------------+
-| Desktop Client   |                   | Dart Client      |
-+--------+---------+                   +--------+---------+
-         | local IPC                            | stdio
-         v                                      v
-+---------------------------+       +----------------------+
-| Rust Host/Daemon          |<------| SSH stdio gateway   |
-| Core | Runtime | Storage  |       +----------------------+
+Desktop UI (Tauri WebView)
+          | Tauri IPC
+          v
++---------------------------+
+| Rust Host                 |
+| Core | Runtime | Storage  |
 +-------------+-------------+
               | PTY / pipes / subprocess
               v
   Codex | Claude | Gemini | Generic CLI
 ```
 
-Rust host/daemon이 AI 세션, CLI 자식 프로세스, SQLite를 단독 소유한다. Tauri 앱은 로컬 IPC로 host에 연결하고, 모바일의 `fastade host --stdio` 명령은 SSH stdio와 로컬 host IPC 사이를 중계한다. 따라서 데스크톱 창이나 모바일 SSH 연결이 종료되어도 실행 중인 AI 세션은 유지된다.
+Rust host가 AI 세션, CLI 자식 프로세스와 저장소를 소유하며 Tauri WebView는 IPC로 host와 통신한다.
 
 ### 4.1 설계 원칙
 
@@ -89,7 +78,7 @@ Rust host/daemon이 AI 세션, CLI 자식 프로세스, SQLite를 단독 소유�
 - **CLI-native 우선:** 기본 화면은 PTY 원본 스트림을 xterm으로 렌더링하며 CLI의 기능과 키 입력을 임의로 축소하지 않는다.
 - **선택적 정규화:** 구조화 이벤트는 알림·상태 요약 같은 보조 기능에만 사용하고 원본 터미널을 대체하지 않는다.
 - **권한 최소화:** 프로젝트별 허용 경로와 명령 정책을 적용한다.
-- **기능 협상:** CLI/호스트/모바일의 버전 차이를 capability negotiation으로 처리한다.
+- **기능 협상:** CLI와 호스트의 버전 차이를 capability negotiation으로 처리한다.
 - **점진적 저하:** 구조화 출력이 없는 CLI도 텍스트 스트림으로 사용할 수 있어야 한다.
 
 ### 4.2 권장 모노레포 구조
@@ -97,7 +86,6 @@ Rust host/daemon이 AI 세션, CLI 자식 프로세스, SQLite를 단독 소유�
 ```text
 apps/
   desktop/                 # Tauri 2 앱 + 웹 UI
-  mobile/                  # Flutter iOS/Android 앱
 crates/
   core/                    # 세션, 정책, 도메인 로직
   host/                    # 로컬 daemon과 lifecycle
@@ -112,7 +100,6 @@ crates/
 packages/
   protocol-schema/         # JSON Schema 또는 protobuf 원본
   desktop-ui/              # Svelte 5 + TypeScript + Vite UI 패키지
-  dart-sdk/                # 스키마에서 생성된 Dart 모델/클라이언트
 docs/
   adr/                     # Architecture Decision Records
   protocol/
@@ -122,11 +109,10 @@ Tauri는 데스크톱 앱의 WebView, 네이티브 패키징, Rust IPC를 제공
 
 ### 4.3 ViewModel 분리
 
-Desktop과 Mobile 모두 `View → ViewModel → Application Client → Host Domain/Core` 방향으로만 의존한다.
+데스크톱 UI는 `View → ViewModel → Application Client → Host Domain/Core` 방향으로만 의존한다.
 
 ```text
 Desktop: Svelte View -> TypeScript ViewModel -> Tauri/Local IPC Client -> Rust Host
-Mobile:  Flutter View -> Dart ViewModel      -> SSH/Stdio Client      -> Rust Host
 ```
 
 - View는 렌더링, 사용자 제스처 전달, 플랫폼 UI만 담당한다.
@@ -134,7 +120,6 @@ Mobile:  Flutter View -> Dart ViewModel      -> SSH/Stdio Client      -> Rust Ho
 - ViewModel은 파일 시스템, SQLite, SSH, Tauri API 또는 CLI 프로세스를 직접 호출하지 않는다.
 - Rust core의 `Session`, `Project`, `Approval`과 화면용 ViewModel/DTO를 분리한다.
 - 프로토콜 DTO를 View에 그대로 노출하지 않고 ViewModel에서 표시 모델로 변환한다.
-- Desktop ViewModel과 Mobile ViewModel은 구현을 공유하지 않되 동일한 상태 전이 fixture로 동작을 검증한다.
 - 세션 상세, 프로젝트 목록, 승인 요청 등 기능 단위 ViewModel을 만들고 전역 mutable state는 두지 않는다.
 - 일회성 UI 효과(알림, 화면 이동)는 지속 상태와 별도 effect stream으로 전달한다.
 
@@ -225,13 +210,11 @@ trait CliAdapter {
 - 앱 재시작 뒤 고아 프로세스를 식별하고 재연결 또는 안전 종료 선택지를 제공한다.
 - 어댑터는 CLI 버전 범위를 선언하며 미지원 버전에서는 경고 후 Generic 모드로 내릴 수 있다.
 
-## 7. 공통 프로토콜
+## 7. 애플리케이션 프로토콜
 
 ### 7.1 전송과 직렬화
 
-- 모바일은 SSH의 exec/subsystem channel 위에서 `fastade host --stdio`를 실행하고 newline-delimited JSON 메시지를 교환한다.
-- SSH가 암호화, 서버 신원 확인, 사용자 인증을 담당하므로 앱 전용 TLS/페어링 프로토콜은 두지 않는다.
-- 데스크톱 로컬 UI는 같은 command/event 의미론을 Tauri IPC로 사용한다.
+- 데스크톱 UI는 command/event 의미론을 Tauri IPC로 사용한다.
 - 대용량 바이너리: 별도 스트림 또는 서명된 일회성 다운로드 경로
 - 모든 메시지: `protocol_version`, `message_id`, `timestamp`, `type`, `payload`
 - 명령은 재시도에 안전하도록 `command_id` 기반 멱등성을 보장한다.
@@ -263,8 +246,6 @@ trait CliAdapter {
 - `session.get_events(after_seq)`
 - `approval.resolve`
 - `artifact.list`, `artifact.get`
-
-모바일 MVP에서는 프로젝트 경로 추가, CLI 설치 경로 변경, 임의 셸 명령 실행을 허용하지 않는다.
 
 ## 8. 데스크톱 요구사항
 
@@ -298,67 +279,35 @@ trait CliAdapter {
 - CSP를 엄격하게 적용하고 원격 웹 콘텐츠를 앱 권한 컨텍스트에서 로드하지 않는다.
 - updater 서명 검증과 플랫폼별 코드 서명을 릴리스 필수 조건으로 둔다.
 
-## 9. 모바일 요구사항
+## 9. 보안 및 개인정보
 
-### 9.1 주요 화면
-
-- SSH 호스트 등록 및 host key 확인
-- 호스트/연결 상태
-- 프로젝트 및 세션 목록
-- 세션 타임라인과 입력 composer
-- 승인 상세 및 승인/거부
-- 알림/보안 설정
-
-### 9.2 연결 모델
-
-- 모바일에서 선택하는 원격 `Server`는 별도의 직접 TCP 연결이 아니라 SSH 접속 프로필이다. 같은 Wi-Fi의 PC도 hostname 또는 LAN IP를 SSH server로 등록한다.
-- 사용자가 hostname, port, username과 인증 수단을 등록한다.
-- 데스크톱과 모바일은 사용자의 `~/.ssh/config`에서 wildcard가 아닌 `Host` alias를 읽어 server 선택 목록으로 제공한다.
-- SSH server의 최초 session folder는 원격 파일시스템을 연결 전에 탐색할 수 없으므로 `~`로 표시한다.
-- 원격 folder가 확정되지 않은 `~` 세션은 CLI를 자동 실행하지 않고 `ssh -tt <Host>`로 login shell만 연다. 사용자가 원격에서 `cd` 후 원하는 CLI를 실행한다.
-- login shell 접속 직후 감지되는 디렉터리(대개 원격 계정의 홈, 예: `/root`)는 사용자가 고른 값이 아니므로 세션 이름·경로에 자동 반영하지 않는다. UI는 감지된 경로를 정보로만 보여주고, 다음 두 경우에만 프로젝트 folder로 확정하고 세션 이름을 그 폴더 이름으로 바꾼다: (1) 사용자가 그 경로를 확인하는 버튼을 직접 누르거나, (2) 그 위치에서 AI CLI를 실제로 실행한다. 실행 전까지 사용자가 `cd`로 여러 폴더를 옮겨 다녀도 세션 이름이 계속 바뀌지 않는다.
-- 향후 명시적인 원격 folder가 선택된 세션에서만 해당 folder로 이동한 뒤 선택한 AI CLI를 자동 실행한다.
-- 인증은 SSH key를 기본으로 하고 password는 선택적으로 지원한다. 비밀은 모바일 OS 보안 저장소에 둔다.
-- 최초 연결 시 SSH host key fingerprint를 사용자가 확인하고 이후 변경 시 연결을 차단한다.
-- SSH 연결 후 `fastade host --stdio`를 실행하여 프로토콜 채널을 연다.
-- 네트워크 전환/절전 후 지수 backoff로 SSH를 재연결하고 `last_seq`부터 동기화한다.
-- 공인 인터넷 노출을 앱이 자동 구성하지 않는다. 사용자가 접근 가능한 SSH 호스트를 준비한다.
-- PC와 폰 사이의 연결 세션은 일시적 transport일 뿐 영속 엔터티로 저장하지 않는다. AI 작업 `Session`은 PC의 SQLite에 독립적으로 유지되므로 폰 연결이 끊겨도 계속 실행된다.
-- Flutter 구현은 `View → MobileViewModel → SessionClient → SshSessionClient`로 분리하며 View에서 SSH와 보안 저장소를 직접 호출하지 않는다.
-- SSH host 메타데이터는 앱 설정 저장소에, password/key 같은 자격 증명은 OS 보안 저장소에 분리해 보관한다.
-
-## 10. 보안 및 개인정보
-
-### 10.1 위협 모델
+### 9.1 위협 모델
 
 - SSH 서버에 접근하는 비인가 클라이언트
 - 악성 프로젝트가 프롬프트/출력으로 권한 상승을 유도하는 경우
 - CLI 출력 또는 진단 로그를 통한 비밀 유출
 - 심볼릭 링크를 이용한 프로젝트 경계 탈출
-- 도난당한 모바일 기기 또는 유출된 SSH 키
+- 유출된 SSH 키
 - 손상되거나 사칭된 CLI 실행 파일
 
-### 10.2 통제
+### 9.2 통제
 
 - 앱은 별도 네트워크 포트를 열지 않으며 사용자가 관리하는 SSH 서버만 사용한다.
-- SSH host key 검증을 필수로 하고 모바일 전용 SSH 키 사용을 권장한다.
-- 비밀은 macOS Keychain, Windows Credential Manager, Linux Secret Service, iOS Keychain, Android Keystore에 저장한다.
+- SSH host key 검증을 필수로 한다.
+- 비밀은 macOS Keychain, Windows Credential Manager, Linux Secret Service에 저장한다.
 - DB에는 자격 증명 원문 대신 secret reference만 저장한다.
 - 프로젝트 canonical path 재검증과 symlink 경계 검사를 모든 파일 작업에 적용한다.
 - 승인 유형을 `read`, `write`, `execute`, `network`, `secret_access`로 분류하고 위험 정보를 표시한다.
 - 개인용 MVP에서는 별도 역할 관리, 생체 승인 정책, 감사 서버를 구현하지 않는다.
 - 향후 배포 버전에서 다중 사용자 권한, 기기 폐기, 텔레메트리 정책을 별도 설계한다.
 
-## 11. 저장소와 동기화
+## 10. 저장소와 동기화
 
 - SQLite + WAL 모드, 마이그레이션 버전 관리
 - 이벤트는 append-only로 저장하고 파생 상태는 재구성 가능하게 한다.
 - 원본 로그는 chunk 단위로 압축하고 최대 저장 용량을 사용자 설정으로 제공한다.
 - MVP에서는 자동 보존 만료 정책을 두지 않고 사용자가 세션을 직접 삭제할 수 있게 한다.
-- 모바일은 필요한 최근 이벤트만 암호화 로컬 캐시에 저장한다.
-- 모바일에서 호스트 데이터 삭제 명령은 MVP에서 제외한다.
-
-## 12. 오류 처리와 관측성
+## 11. 오류 처리와 관측성
 
 - 사용자 오류, 어댑터 호환성 오류, CLI 프로세스 오류, 호스트 연결 오류를 구분한다.
 - 모든 오류는 안정적인 코드, 사용자 메시지, 복구 제안, correlation id를 가진다.
@@ -366,35 +315,33 @@ trait CliAdapter {
 - 진단 번들은 앱/OS/CLI 버전, capability, 마스킹된 로그, DB 스키마 버전을 포함한다.
 - 세션 프로세스 종료와 앱 crash 후 복구 여부를 측정한다.
 
-## 13. 비기능 요구사항
+## 12. 비기능 요구사항
 
 | 항목 | MVP 기준 |
 |---|---|
 | 데스크톱 시작 | 일반 개발 머신에서 warm start 2초 이내 목표 |
 | 스트림 지연 | 로컬 CLI 출력 → UI 표시 p95 100ms 이내 |
-| 모바일 지연 | LAN에서 호스트 이벤트 → UI p95 300ms 이내 |
 | 안정성 | 정상 종료된 이벤트의 유실 0건; 앱 crash 후 저장 이벤트 복원 |
 | 확장성 | 호스트당 동시 실행 세션 4개, 보관 세션 10,000개 기준 검증 |
-| 접근성 | 데스크톱 WCAG 2.2 AA 목표, 모바일 플랫폼 접근성 API 준수 |
+| 접근성 | 데스크톱 WCAG 2.2 AA 목표 |
 | 국제화 | 문자열 외부화; 초기 언어 한국어/영어 |
 | 지원 OS | 출시 시점 기준 각 플랫폼의 현재 및 직전 주요 버전 원칙 |
 
-정확한 최소 OS 버전은 Tauri 2, Flutter 및 배포 스토어의 출시 시점 지원 정책을 확인해 릴리스 ADR에서 고정한다.
+정확한 최소 OS 버전은 Tauri 2의 출시 시점 지원 정책을 확인해 릴리스 ADR에서 고정한다.
 
-## 14. 테스트 전략
+## 13. 테스트 전략
 
 - Rust core 단위 테스트: 상태 전이, 정책, 경로 경계, 이벤트 순서
 - 어댑터 golden test: CLI 버전별 캡처 출력 → 정규화 이벤트
 - fake CLI 프로세스를 이용한 종료, hang, partial chunk, malformed JSON 테스트
-- protocol contract test: Rust/TypeScript/Dart 동일 fixture 직렬화
+- protocol contract test: Rust/TypeScript 동일 fixture 직렬화
 - DB migration 및 crash recovery 테스트
 - Tauri IPC 권한/입력 fuzz test
-- 모바일 재연결, 중복 명령, 누락 이벤트 복구 테스트
-- macOS/Windows/Linux 및 iOS/Android smoke test
+- macOS/Windows/Linux smoke test
 - SSH host key 불일치, 인증 실패, 연결 중단 테스트
-- Desktop/Mobile ViewModel의 상태 전이 및 effect stream 테스트
+- Desktop ViewModel의 상태 전이 및 effect stream 테스트
 
-## 15. MVP 수용 기준
+## 14. MVP 수용 기준
 
 다음 조건을 모두 만족하면 MVP 기능 완료로 본다.
 
@@ -404,23 +351,20 @@ trait CliAdapter {
 4. CLI가 요청한 명령/파일 쓰기를 UI에서 승인 또는 거부할 수 있다.
 5. 세션 중단 시 자식 프로세스가 남지 않는다.
 6. CLI의 비정상 종료가 앱 crash 없이 오류 상태로 변환된다.
-7. 모바일에 SSH 호스트를 등록하고 세션 조회, 입력, 승인, 중단이 가능하다.
-8. 연결이 끊겼다가 복구되어도 이벤트 누락/중복 표시가 없다.
-9. SSH host key가 변경되면 명시적 재승인 전까지 연결되지 않는다.
-10. 진단 번들에서 토큰, 키, 일반적인 비밀 패턴이 마스킹된다.
-11. protocol fixture가 Rust, TypeScript, Dart에서 동일하게 통과한다.
-12. View가 transport/storage API를 직접 참조하지 않는 아키텍처 검사가 통과한다.
-13. 지원 대상 5개 OS의 배포 빌드와 최소 smoke test가 CI에서 통과한다.
+7. 연결이 끊겼다가 복구되어도 이벤트 누락/중복 표시가 없다.
+8. SSH host key가 변경되면 명시적 재승인 전까지 연결되지 않는다.
+9. 진단 번들에서 토큰, 키, 일반적인 비밀 패턴이 마스킹된다.
+10. protocol fixture가 Rust와 TypeScript에서 동일하게 통과한다.
+11. View가 transport/storage API를 직접 참조하지 않는 아키텍처 검사가 통과한다.
+12. 지원 대상 3개 OS의 배포 빌드와 최소 smoke test가 CI에서 통과한다.
 
-## 16. 구현 단계
+## 15. 구현 단계
 
 ### Phase 0 — 검증 및 ADR
 
 - 대상 CLI별 비대화형/구조화 출력, resume, 승인 방식 조사
 - PTY와 pipe 비교 spike
 - JSON Schema 대 protobuf 결정
-- Flutter와 Rust 프로토콜 코드 생성 검증
-- Flutter SSH channel과 `fastade host --stdio` prototype
 
 ### Phase 1 — Desktop Vertical Slice
 
@@ -434,52 +378,41 @@ trait CliAdapter {
 - 승인, diff, usage, resume capability
 - 버전 호환성 fixture/CI
 
-### Phase 3 — Mobile Companion
-
-- 공통 스키마 기반 Dart SDK
-- SSH 호스트 등록, host key 검증, 재연결, 세션 UI
-- 원격 입력, 승인/거부, 중단
-
-### Phase 4 — Hardening & Release
+### Phase 3 — Hardening & Release
 
 - 보안 리뷰, 성능/복구 테스트, 접근성
 - 코드 서명, 자동 업데이트, 스토어 배포
 - 진단 및 사용자 문서
 
-## 17. 주요 리스크와 대응
+## 16. 주요 리스크와 대응
 
 | 리스크 | 영향 | 대응 |
 |---|---|---|
 | CLI 출력/플래그의 잦은 변경 | 어댑터 파손 | 버전 범위, golden fixture, Generic fallback |
 | PTY 출력 파싱의 불안정성 | 이벤트 오분류 | 구조화 모드 우선, 원본 보존, 보수적 파서 |
-| 모바일 직접 실행 기대 | 제품 기대 불일치 | 호스트/컴패니언 모델을 온보딩과 문서에 명시 |
 | 원격 승인 악용 | 코드/데이터 손상 | 명령 상세 표시, SSH key 분리, 향후 배포 전 권한 정책 추가 |
 | 앱 종료 후 프로세스 고아화 | 리소스/보안 문제 | process group/job object 관리, startup reconciliation |
 | 플랫폼별 프로세스 차이 | 일정 증가 | runtime 추상화와 OS별 통합 테스트 |
 | 여러 CLI 라이선스/약관 차이 | 배포 제한 | 바이너리 번들 금지, 사용자 설치본 연동, 출시 전 검토 |
 
-## 18. 확정 사항과 남은 결정
+## 17. 확정 사항과 남은 결정
 
-### 18.1 확정 사항
+### 17.1 확정 사항
 
 - 제품명: `fastade`
 - 데스크톱 앱 프레임워크: Tauri 2 + Rust
 - 데스크톱 View: Svelte 5 + TypeScript + Vite
-- 모바일: Flutter
 - 기본 CLI: Codex CLI, Gemini CLI, Claude Code
-- 모바일 원격 접속: SSH
 - 초기 사용자 모델: 단일 사용자
 - 자동 데이터 보존 정책: MVP에서 제외
 
-### 18.2 Phase 0에서 결정할 항목
+### 17.2 Phase 0에서 결정할 항목
 
 1. 프로토콜 스키마(JSON Schema + 코드 생성 또는 protobuf)
 2. 지원 CLI의 정확한 최소 버전
-3. SSH transport는 `dartssh2`, 자격 증명 저장은 `flutter_secure_storage`를 사용한다. 최초 vertical slice는 password 인증을 제공하고 전용 private key 인증을 추가한다.
-4. 푸시 알림 전달 방식
-5. 현재 데스크톱 vertical slice(`apps/desktop`)는 Section 5의 `Server`/`Project` 모델을 아직 구현하지 않았다 — CLI·model·SSH endpoint·path를 하나로 묶은 flat한 `SavedSession` 프로필만 존재한다. `SavedSession`을 Project 중심 모델(Project는 고정, server·CLI·model은 세션 생성 시 자유 선택, pin은 Project의 default 저장)로 마이그레이션하는 작업과, 그때 기존에 저장된 `saved-sessions.json`을 깨지 않고 옮기는 방법을 Phase 1~2 사이에서 별도로 설계한다.
+3. 현재 데스크톱 vertical slice(`apps/desktop`)는 Section 5의 `Server`/`Project` 모델을 아직 구현하지 않았다 — CLI·model·SSH endpoint·path를 하나로 묶은 flat한 `SavedSession` 프로필만 존재한다. `SavedSession`을 Project 중심 모델(Project는 고정, server·CLI·model은 세션 생성 시 자유 선택, pin은 Project의 default 저장)로 마이그레이션하는 작업과, 그때 기존에 저장된 `saved-sessions.json`을 깨지 않고 옮기는 방법을 Phase 1~2 사이에서 별도로 설계한다.
 
-## 19. Definition of Done
+## 18. Definition of Done
 
 기능은 코드 작성만으로 완료되지 않는다. 다음을 모두 충족해야 한다.
 
