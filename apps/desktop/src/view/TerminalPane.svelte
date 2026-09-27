@@ -21,6 +21,8 @@
   let fitRef: FitAddon | undefined;
   let scheduleFitRef: (() => void) | undefined;
 
+  const MOUSE_TRACKING_RESET = '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l';
+
   $: if (terminalRef && terminalRef.options.fontSize !== fontSize) {
     terminalRef.options.fontSize = fontSize;
     scheduleFitRef?.();
@@ -59,6 +61,11 @@
     fitRef = fit;
     terminal.loadAddon(fit);
     terminal.open(container);
+    const resetMouseTracking = (): void => {
+      // This changes xterm's local input mode only. It must never be sent to
+      // the PTY, where it would be interpreted as keyboard input.
+      terminal.write(MOUSE_TRACKING_RESET);
+    };
     const reportActivityScreen = (): void => {
       const buffer = terminal.buffer.active;
       const end = buffer.baseY + terminal.rows;
@@ -89,7 +96,7 @@
         // garbage "<35;4;19M"-style bytes fed into the now-plain shell —
         // reset every mouse-reporting mode once replay settles, local only,
         // never forwarded as input.
-        if (replayWrites === 0) terminal.write('\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l');
+        if (replayWrites === 0) resetMouseTracking();
         reportActivityScreen();
       });
     });
@@ -125,6 +132,14 @@
     const cwd = terminal.parser.registerOscHandler(55123, (data) => {
       if (!data) return false;
       onCurrentDirectory(sessionId, data);
+      // The private cwd report is emitted by the outer shell immediately
+      // before each prompt. If a full-screen child was killed or crashed, it
+      // may never have disabled the mouse mode it enabled on startup. Reset
+      // after the current parser turn so pointer motion cannot leak SGR mouse
+      // reports ("<35;148;50M") into the now-plain shell.
+      queueMicrotask(() => {
+        if (terminalRef === terminal) resetMouseTracking();
+      });
       return true;
     });
     let lastSyncedSize = '';
