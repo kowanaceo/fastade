@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { CreateSessionInput, DesktopClient, RemoteDirectoryListing, SaveSessionInput, SshHost, TerminalEvent } from '../application/desktop-client';
-import type { AgentUsage, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, UpdateServerInput } from '../domain/session';
+import type { AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput } from '../domain/session';
 
 export class TauriDesktopClient implements DesktopClient {
   listSessions(): Promise<CliSessionSummary[]> {
@@ -27,6 +27,10 @@ export class TauriDesktopClient implements DesktopClient {
 
   deleteSavedSession(id: string): Promise<void> {
     return invoke<void>('delete_saved_session', { id });
+  }
+
+  replaceSavedSessions(profiles: SavedSessionProfile[]): Promise<void> {
+    return invoke<void>('replace_saved_sessions', { profiles });
   }
 
   listSshHosts(): Promise<SshHost[]> {
@@ -137,6 +141,30 @@ export class TauriDesktopClient implements DesktopClient {
 
   setMcpAgentEnabled(cli: CliKind, enabled: boolean): Promise<void> {
     return invoke<void>('set_mcp_agent_enabled', { cli, enabled });
+  }
+
+  googleAuthStatus(): Promise<AuthStatus> {
+    return invoke<AuthStatus>('google_auth_status');
+  }
+
+  googleSignIn(): Promise<AuthUser> {
+    return invoke<AuthUser>('google_sign_in');
+  }
+
+  googleSignOut(): Promise<void> {
+    return invoke<void>('google_sign_out');
+  }
+
+  syncSnapshot(): Promise<SyncSnapshot> {
+    return invoke<SyncSnapshot>('sync_snapshot');
+  }
+
+  syncChanges(cursor: number, limit = 500, waitSeconds = 25): Promise<SyncChangesResponse> {
+    return invoke<SyncChangesResponse>('sync_changes', { cursor, limit, waitSeconds });
+  }
+
+  syncPush(changes: SyncPushChange[]): Promise<SyncPushResponse> {
+    return invoke<SyncPushResponse>('sync_push', { changes });
   }
 
 }

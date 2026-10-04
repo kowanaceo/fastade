@@ -87,3 +87,72 @@ export interface AgentUsage {
   windows: UsageWindow[];
   message?: string;
 }
+
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  picture?: string;
+}
+
+export interface AuthStatus {
+  configured: boolean;
+  user?: AuthUser;
+  deviceId?: string;
+}
+
+export type SyncEntityType = 'profile' | 'group' | 'pin' | 'setting' | 'device_path';
+
+export interface SyncEntity {
+  entityType: SyncEntityType;
+  entityId: string;
+  version: number;
+  payload: Record<string, unknown>;
+  deleted: boolean;
+  deletedAt?: string | null;
+  updatedAt: string;
+  updatedByDevice?: string;
+}
+
+export interface SyncSnapshot {
+  cursor: number;
+  entities: SyncEntity[];
+}
+
+export interface SyncChange extends SyncEntity {
+  cursor: number;
+  changeId: string;
+  deviceId: string;
+  operation: 'upsert' | 'delete';
+}
+
+export interface SyncChangesResponse {
+  cursor: number;
+  hasMore: boolean;
+  changes: SyncChange[];
+}
+
+export interface SyncPushChange {
+  changeId: string;
+  entityType: SyncEntityType;
+  entityId: string;
+  operation: 'upsert' | 'delete';
+  baseVersion?: number;
+  payload: Record<string, unknown>;
+}
+
+export interface SyncPushResult {
+  changeId: string;
+  status: 'accepted' | 'duplicate' | 'conflict' | 'rejected';
+  entityType: SyncEntityType;
+  entityId: string;
+  version?: number;
+  cursor?: number;
+  reason?: string;
+  current?: SyncEntity;
+}
+
+export interface SyncPushResponse {
+  cursor: number;
+  results: SyncPushResult[];
+}

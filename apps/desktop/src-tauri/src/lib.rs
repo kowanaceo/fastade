@@ -1,3 +1,4 @@
+mod auth;
 pub mod mcp;
 mod mcp_settings;
 mod remote_fs;
@@ -10,11 +11,14 @@ mod windows;
 
 use tauri::Manager;
 
+use auth::{
+    google_auth_status, google_sign_in, google_sign_out, sync_changes, sync_push, sync_snapshot,
+};
 use mcp_settings::{mcp_agent_status, set_mcp_agent_enabled};
 use remote_fs::list_remote_directory;
 use saved_sessions::{
-    delete_saved_session, list_saved_sessions, remember_saved_session_path, save_session_profile,
-    update_saved_session,
+    delete_saved_session, list_saved_sessions, remember_saved_session_path, replace_saved_sessions,
+    save_session_profile, update_saved_session,
 };
 use servers::{
     create_managed_server, delete_managed_server, list_managed_servers, update_managed_server,
@@ -67,6 +71,7 @@ pub fn run() {
             remember_saved_session_path,
             update_saved_session,
             delete_saved_session,
+            replace_saved_sessions,
             interrupt_session,
             reconnect_session,
             close_session,
@@ -83,7 +88,13 @@ pub fn run() {
             clear_session_activity_override,
             mcp_agent_status,
             set_mcp_agent_enabled,
-            upload_file_to_session
+            upload_file_to_session,
+            google_auth_status,
+            google_sign_in,
+            google_sign_out,
+            sync_snapshot,
+            sync_changes,
+            sync_push
         ])
         .run(tauri::generate_context!())
         .expect("failed to run fastade");

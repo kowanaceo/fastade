@@ -59,6 +59,28 @@ pub fn list_saved_sessions(app: tauri::AppHandle) -> Result<Vec<SavedSession>, S
     read_profiles(&profiles_path(&app)?)
 }
 
+/// Replaces the local projection after a cloud snapshot has been merged in
+/// the view model. Runtime PTYs are deliberately untouched: synced profiles
+/// are reusable session metadata, not live processes.
+#[tauri::command]
+pub fn replace_saved_sessions(
+    profiles: Vec<SavedSession>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    if profiles.iter().any(|profile| {
+        profile.id.trim().is_empty()
+            || profile.name.trim().is_empty()
+            || profile.last_endpoint.trim().is_empty()
+    }) {
+        return Err("synced session profiles are invalid".to_owned());
+    }
+    let mut ids = std::collections::HashSet::new();
+    if profiles.iter().any(|profile| !ids.insert(&profile.id)) {
+        return Err("synced session profiles contain duplicate ids".to_owned());
+    }
+    write_profiles(&profiles_path(&app)?, &profiles)
+}
+
 #[tauri::command]
 pub fn save_session_profile(
     input: SaveSessionInput,

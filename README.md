@@ -1,20 +1,22 @@
 # fastade
 
-Codex CLI, Claude Code, Gemini CLI 세션을 한곳에서 실행하고 관리하기 위한 데스크톱 클라이언트입니다.
+A desktop client for running and managing Codex CLI, Claude Code, and Gemini CLI sessions in one place.
 
-> 이 프로젝트는 현재 초기 개발 단계입니다. 데이터 형식과 기능이 예고 없이 바뀔 수 있습니다.
+> This project is in early development. Data formats and features may change without notice.
 
-## 데스크톱 앱 빌드
+![fastade screenshot](docs/images/screenshot.png)
 
-미리 빌드된 설치 파일은 제공하지 않습니다. Tauri의 데스크톱 번들은 플랫폼별 네이티브 도구를 사용하므로 Windows 설치 파일은 Windows에서, Linux 패키지는 Linux에서, macOS 앱은 macOS에서 빌드하세요. 아래 명령은 저장소 루트에서 실행합니다.
+## Building the desktop app
 
-공통 요구 사항은 다음과 같습니다.
+Prebuilt installers are not provided. Tauri desktop bundles rely on platform-native tooling, so build Windows installers on Windows, Linux packages on Linux, and the macOS app on macOS. Run the commands below from the repository root.
+
+Common requirements:
 
 - [Git](https://git-scm.com/downloads)
-- Node.js 22.12 이상인 22.x 버전 또는 Node.js 24 이상과 npm
-- Rust 1.88 이상과 Cargo. [rustup](https://rustup.rs/)으로 stable toolchain을 설치하는 방식을 권장합니다.
+- Node.js 22.12 or later in the 22.x line, or Node.js 24 or later, with npm
+- Rust 1.88 or later with Cargo. Installing the stable toolchain via [rustup](https://rustup.rs/) is recommended.
 
-처음 한 번 저장소를 받고 JavaScript 의존성을 설치합니다. 잠금 파일과 동일한 버전을 설치하기 위해 `npm ci`를 사용합니다.
+Clone the repository and install the JavaScript dependencies once. `npm ci` installs the exact versions in the lockfile.
 
 ```bash
 git clone https://github.com/kowanaceo/fastade.git
@@ -24,9 +26,9 @@ npm ci
 
 ### Windows
 
-1. [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)를 설치하면서 **Desktop development with C++** workload를 선택합니다.
-2. [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section)의 Evergreen Bootstrapper를 설치합니다. Windows 10(1803 이상)과 Windows 11에는 보통 이미 설치되어 있습니다.
-3. 새 PowerShell을 열고 저장소 루트에서 빌드합니다.
+1. Install the [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and select the **Desktop development with C++** workload.
+2. Install the Evergreen Bootstrapper of the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section). It is usually already present on Windows 10 (1803 and later) and Windows 11.
+3. Open a new PowerShell and build from the repository root:
 
 ```powershell
 rustup default stable-msvc
@@ -34,16 +36,16 @@ npm run check
 npm run tauri:build
 ```
 
-설치 파일은 다음 위치에 생성됩니다.
+Installers are generated at:
 
 - MSI: `apps\desktop\src-tauri\target\release\bundle\msi\`
-- NSIS 설치 프로그램(`.exe`): `apps\desktop\src-tauri\target\release\bundle\nsis\`
+- NSIS installer (`.exe`): `apps\desktop\src-tauri\target\release\bundle\nsis\`
 
-현재 앱 자체는 Windows에서 빌드·실행할 수 있지만, MCP 브리지의 로컬 IPC는 Unix socket 기반이므로 Windows에서는 MCP 연동이 동작하지 않습니다.
+The app itself builds and runs on Windows, but the MCP bridge uses Unix sockets for local IPC, so MCP integration does not work on Windows.
 
 ### Linux (Ubuntu/Debian)
 
-먼저 Tauri 2의 WebKitGTK 및 시스템 빌드 의존성을 설치합니다.
+First install the Tauri 2 WebKitGTK and system build dependencies:
 
 ```bash
 sudo apt update
@@ -58,56 +60,57 @@ sudo apt install libwebkit2gtk-4.1-dev \
   librsvg2-dev
 ```
 
-그다음 저장소 루트에서 빌드합니다.
+Then build from the repository root:
 
 ```bash
 npm run check
 npm run tauri:build
 ```
 
-패키지는 `apps/desktop/src-tauri/target/release/bundle/` 아래의 `deb/`, `rpm/`, `appimage/` 디렉터리에 생성됩니다. AppImage의 호환 범위는 빌드한 시스템의 glibc 버전에 영향을 받으므로 배포용 빌드는 지원하려는 가장 오래된 환경에서 수행하세요. Tauri는 Ubuntu 22.04 또는 Debian 12를 기준 환경의 예로 권장합니다. Fedora, Arch 등 다른 배포판의 의존성 명령은 [Tauri 2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux)를 참고하세요.
+Packages are generated under `apps/desktop/src-tauri/target/release/bundle/` in the `deb/`, `rpm/`, and `appimage/` directories. AppImage compatibility depends on the glibc version of the build machine, so build release artifacts on the oldest environment you want to support. Tauri suggests Ubuntu 22.04 or Debian 12 as baseline examples. For other distributions such as Fedora or Arch, see the [Tauri 2 Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
 
 ### macOS
 
-데스크톱 앱만 빌드할 때는 전체 Xcode 대신 Xcode Command Line Tools만 설치해도 됩니다.
+To build only the desktop app, the Xcode Command Line Tools are enough; full Xcode is not required.
 
 ```bash
 xcode-select --install
 ```
 
-설치가 끝나면 저장소 루트에서 빌드합니다.
+Then build from the repository root:
 
 ```bash
 npm run check
 npm run tauri:build
 ```
 
-결과물은 다음 위치에 생성됩니다.
+Outputs:
 
-- 앱 번들: `apps/desktop/src-tauri/target/release/bundle/macos/fastade.app`
-- 디스크 이미지: `apps/desktop/src-tauri/target/release/bundle/dmg/`
+- App bundle: `apps/desktop/src-tauri/target/release/bundle/macos/fastade.app`
+- Disk image: `apps/desktop/src-tauri/target/release/bundle/dmg/`
 
-기본 로컬 빌드는 Apple Developer ID로 서명·공증되지 않습니다. 다른 Mac에 배포하려면 [Tauri의 macOS 코드 서명 안내](https://v2.tauri.app/distribute/sign/macos/)에 따라 Developer ID 인증서로 서명하고 공증해야 합니다.
+Default local builds are not signed or notarized with an Apple Developer ID. To distribute to other Macs, sign and notarize with a Developer ID certificate following [Tauri's macOS code signing guide](https://v2.tauri.app/distribute/sign/macos/).
 
-## 사용 가이드
+## Usage guide
 
-단축키와 핵심 기능은 사용 가이드를 참고하세요: [한국어](docs/USAGE.ko.md) · [English](docs/USAGE.en.md)
+See the usage guide for shortcuts and key features: [한국어](docs/USAGE.ko.md) · [English](docs/USAGE.en.md)
 
-## 주요 기능
+## Features
 
-- 로컬 또는 SSH 서버의 터미널 세션 생성·복원·관리
-- Codex CLI, Claude Code, Gemini CLI 실행과 기본 모델 설정
-- 세션별 터미널 팝아웃과 작업 상태·메모리 사용량 표시
-- Codex와 Claude Code 사용량 조회
-- 선택형 읽기 전용 MCP 연동을 통한 전체 세션 상태 조회
+- Create, restore, and manage terminal sessions on local machines or SSH servers
+- Run Codex CLI, Claude Code, and Gemini CLI with configurable default models
+- Per-session terminal pop-out windows with activity status and memory usage
+- Codex and Claude Code usage display
+- Session records (see [docs/SESSION-RECORDS.ko.md](docs/SESSION-RECORDS.ko.md), Korean)
+- Optional read-only MCP integration to query the state of all sessions
 
-## 추가 요구 사항
+## Additional requirements
 
-- 사용할 AI CLI(Codex CLI, Claude Code, Gemini CLI)는 별도 설치 및 로그인이 필요합니다.
+- The AI CLIs you want to use (Codex CLI, Claude Code, Gemini CLI) must be installed and signed in separately.
 
-현재 MCP 브리지의 로컬 IPC는 macOS와 Linux에서만 동작합니다. Windows용 named pipe 지원은 아직 구현되지 않았습니다.
+The MCP bridge's local IPC currently works only on macOS and Linux. Windows named-pipe support is not implemented yet.
 
-## 데스크톱 개발
+## Desktop development
 
 ```bash
 npm install
@@ -115,46 +118,50 @@ npm run check
 npm run tauri:dev
 ```
 
-프로덕션 번들은 다음 명령으로 만듭니다.
+Create a production bundle with:
 
 ```bash
 npm run tauri:build
 ```
 
-브라우저 단독 실행은 지원하지 않습니다. 프런트엔드는 Tauri IPC를 통해 Rust host와 통신하므로 `npm run tauri:dev`로 실행해야 합니다.
+Running in a browser alone is not supported. The frontend talks to the Rust host through Tauri IPC, so run it with `npm run tauri:dev`.
 
-## AI CLI 연동과 보안
+## Google sign-in configuration
 
-설정에서 MCP 연동을 켜면 fastade는 해당 CLI의 사용자 설정 파일에 `fastade_mcp` 항목을 추가합니다.
+Google sign-in needs an OAuth client of type "Desktop app". The credentials are never stored in the repository. At build time, `build.rs` reads them from the `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` environment variables, or from the git-ignored `.secrets/google-oauth-desktop.json` file (the JSON downloaded from Google Cloud Console). Without them the app still builds, but sign-in is disabled.
 
-| CLI | 변경되는 사용자 설정 | 상태 감지 |
+## AI CLI integration and security
+
+When you enable MCP integration in settings, fastade adds a `fastade_mcp` entry to the user configuration files of the corresponding CLI.
+
+| CLI | User config files modified | Status detection |
 | --- | --- | --- |
-| Codex | `~/.codex/config.toml`, `~/.codex/hooks.json` | 턴·도구 실행, 승인 요청, 중단/완료 lifecycle hook과 turn-complete 알림 |
-| Claude Code | `~/.claude.json`, `~/.claude/settings.json` | 세션·턴·도구 실행, 승인 요청, 완료/실패 및 사용자 입력 알림 hook |
-| Gemini CLI | `~/.gemini/settings.json` | 터미널 출력 기반 추정 |
+| Codex | `~/.codex/config.toml`, `~/.codex/hooks.json` | Lifecycle hooks for turns, tool runs, approval requests, and interrupt/completion, plus turn-complete notifications |
+| Claude Code | `~/.claude.json`, `~/.claude/settings.json` | Hooks for sessions, turns, tool runs, approval requests, completion/failure, and user-input notifications |
+| Gemini CLI | `~/.gemini/settings.json` | Inferred from terminal output |
 
-fastade가 만든 항목만 제거하며 기존 사용자 설정은 유지합니다. Codex는 새 hook을 바로 실행하지 않을 수 있습니다. Codex에서 `/hooks`를 열어 fastade가 추가한 hook을 검토하고 신뢰해야 작업 중/대기 상태가 정확히 표시됩니다.
+fastade removes only the entries it created and leaves your existing settings intact. Codex may not run new hooks immediately: open `/hooks` in Codex and review and trust the hooks fastade added, otherwise the working/idle status will not be accurate.
 
-SSH 비밀번호는 OS 보안 저장소에 저장됩니다. 저장소에 인증정보, 개인키, `.env`, 서명 키를 커밋하지 마세요. 이미 커밋한 비밀정보는 `.gitignore`만으로 제거되지 않으므로 키를 폐기·재발급하고 Git 기록에서도 삭제해야 합니다.
+SSH passwords are stored in the OS secure storage. Never commit credentials, private keys, `.env` files, or signing keys to the repository. A secret that has already been committed is not removed by `.gitignore`; revoke and reissue the key and purge it from Git history as well.
 
-## 프로젝트 구조
+## Project structure
 
 ```text
-apps/desktop/  Svelte 5 + TypeScript + Tauri 2 데스크톱 앱
-SPEC.md        제품 및 UX 명세
+apps/desktop/  Svelte 5 + TypeScript + Tauri 2 desktop app
+SPEC.md        Product and UX specification
 ```
 
-## 검사
+## Checks
 
 ```bash
 npm run check
 cd apps/desktop/src-tauri && cargo test
 ```
 
-## 기여
+## Contributing
 
-이슈와 pull request를 환영합니다. 큰 변경은 구현 전에 이슈에서 범위와 방향을 먼저 논의해 주세요. 변경 사항에는 관련 테스트를 포함하고 위 검사 명령을 통과해야 합니다.
+Issues and pull requests are welcome. For larger changes, please discuss the scope and direction in an issue before implementing. Include relevant tests, and make sure the checks above pass.
 
-## 라이선스
+## License
 
-아직 라이선스가 지정되지 않았습니다. 라이선스 파일이 추가되기 전까지는 저작권자의 명시적 허가 없이 이 코드를 복제·수정·배포할 수 없습니다.
+[MIT](LICENSE)

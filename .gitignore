@@ -7,6 +7,7 @@ dist/
 .vite/
 
 # Local environment and credentials
+.secrets/
 .env
 .env.*
 !.env.example
