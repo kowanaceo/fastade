@@ -234,6 +234,33 @@ pub async fn sync_push(changes: Vec<serde_json::Value>) -> Result<serde_json::Va
     authenticated_post("/sync/push", &serde_json::json!({ "changes": changes })).await
 }
 
+/// A host's usage snapshot, stored by the account so other devices can show
+/// it. One row per (agent, host) that each upload replaces; nothing is kept
+/// as history, and the sync change log is deliberately not involved.
+#[tauri::command]
+pub async fn put_usage_snapshot(snapshot: serde_json::Value) -> Result<(), String> {
+    let part = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| {
+                !value.is_empty()
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            })
+            .map(str::to_owned)
+            .ok_or_else(|| format!("invalid usage snapshot {key}"))
+    };
+    let (agent, host) = (part("agentId")?, part("hostId")?);
+    authenticated_put(&format!("/usage/snapshots/{agent}/{host}"), &snapshot).await
+}
+
+#[tauri::command]
+pub async fn list_usage_snapshots() -> Result<serde_json::Value, String> {
+    authenticated_get("/usage/snapshots").await
+}
+
 fn receive_callback(listener: TcpListener, expected_state: &str) -> Result<String, String> {
     listener
         .set_nonblocking(true)
@@ -379,6 +406,38 @@ async fn authenticated_post(
             .map_err(|error| format!("Could not reach the fastade server: {error}"))?;
     }
     response_json(response, "Fastade sync failed").await
+}
+
+async fn authenticated_put(path: &str, body: &serde_json::Value) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let mut session = read_session().ok_or_else(|| "Sign in to sync usage.".to_owned())?;
+    let mut response = client
+        .put(format!("{BACKEND_BASE_URL}{path}"))
+        .bearer_auth(&session.access_token)
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach the fastade server: {error}"))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        session = refresh_session_if_needed(&client, session).await?;
+        response = client
+            .put(format!("{BACKEND_BASE_URL}{path}"))
+            .bearer_auth(&session.access_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| format!("Could not reach the fastade server: {error}"))?;
+    }
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let detail = response.text().await.unwrap_or_default();
+    Err(if detail.trim().is_empty() {
+        format!("Fastade usage upload failed ({status})")
+    } else {
+        format!("Fastade usage upload failed ({status}): {detail}")
+    })
 }
 
 async fn refresh_session_if_needed(

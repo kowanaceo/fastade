@@ -1,7 +1,8 @@
 import type { DesktopClient, SshHost, TerminalEvent } from '../application/desktop-client';
+import { localHostId, localSnapshot, mergeHostUsage, parseSnapshotList, shouldUpload, windowsKey } from '../domain/usage-snapshots';
 import { syncSessionRecords } from '../application/session-record-sync';
 import type { SessionRecordRepository } from '../application/session-record-repository';
-import { type AgentModelOption, type AgentUsage, type AuthUser, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type SyncEntity, type SyncPushChange, type UpdateServerInput, type WebAgent } from '../domain/session';
+import { type AgentModelOption, type AgentUsage, type AuthUser, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type SyncEntity, type SyncPushChange, type UpdateServerInput, type UsageSnapshot, type WebAgent } from '../domain/session';
 import { detectAgentActivity, type AgentActivity } from './activity-detector';
 import { detectAgentLaunch } from './agent-command';
 
@@ -106,6 +107,9 @@ export class AppViewModel {
   recordsRevision = $state(0);
   webAgents = $state<WebAgent[]>(DEFAULT_WEB_AGENTS.map((agent) => ({ ...agent })));
   agentUsage = $state<Record<string, AgentUsage>>({});
+  /** Other SSH hosts and devices, newest snapshot per agent and host. */
+  hostUsage = $state<UsageSnapshot[]>([]);
+  private usageUploads = new Map<string, { key: string; at: number }>();
   agentDefaultModels = $state<Record<CliKind, string>>({ codex: '', claude: '', gemini: '' });
   agentModels = $state<Record<CliKind, AgentModelOption[]>>({ codex: [], claude: [], gemini: [] });
   /** Whether that CLI's own MCP config currently registers fastade's
@@ -478,15 +482,41 @@ export class AppViewModel {
     this.persistWebAgents();
   }
 
-  async refreshAgentUsage(): Promise<void> {
+  /** `force` is the refresh button: it also bypasses the cache of Claude's
+   * slow-to-read limits. The timer leaves that cache alone. */
+  async refreshAgentUsage(force = false): Promise<void> {
     const enabled = this.webAgents.filter((agent) => agent.enabled);
     const entries = await Promise.all(enabled.map(async (agent): Promise<[string, AgentUsage]> => {
-      try { return [agent.id, await this.client.getAgentUsage(agent.id)]; }
+      try { return [agent.id, await this.client.getAgentUsage(agent.id, force)]; }
       catch (error) {
         return [agent.id, { agentId: agent.id, status: 'error', windows: [], message: this.message(error) }];
       }
     }));
     this.agentUsage = Object.fromEntries(entries);
+    await this.refreshHostUsage();
+  }
+
+  /** Adds what this device cannot see itself: SSH hosts with a live session
+   * and, when signed in, the account's snapshots from other devices. Signed
+   * out, or against a server without usage sync, only the local view remains. */
+  private async refreshHostUsage(): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    let remote: UsageSnapshot[] = [];
+    try { remote = await this.client.getRemoteUsage(); } catch { /* no live ssh session, or the host is unreachable */ }
+    let shared: UsageSnapshot[] = [];
+    if (this.authUser && this.authDeviceId) {
+      const local = Object.entries(this.agentUsage).flatMap(([id, usage]) => localSnapshot(id, usage, this.authDeviceId, now) ?? []);
+      try {
+        for (const snapshot of [...local, ...remote]) {
+          const key = `${snapshot.agentId}\n${snapshot.hostId}`;
+          if (!shouldUpload(this.usageUploads.get(key), snapshot, now)) continue;
+          await this.client.putUsageSnapshot(snapshot);
+          this.usageUploads.set(key, { key: windowsKey(snapshot.windows), at: now });
+        }
+        shared = parseSnapshotList(await this.client.listUsageSnapshots());
+      } catch { /* usage sync is optional: keep showing the local view */ }
+    }
+    this.hostUsage = mergeHostUsage([remote, shared], localHostId(this.authDeviceId));
   }
 
   async refreshAgentModels(endpoint = 'local', onlyCli?: CliKind): Promise<void> {

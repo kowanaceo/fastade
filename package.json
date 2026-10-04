@@ -11,6 +11,7 @@
     "build": "vite build --config apps/desktop/vite.config.ts",
     "check": "svelte-check --tsconfig apps/desktop/tsconfig.json",
     "test:activity": "node --experimental-strip-types --test apps/desktop/src/viewmodel/activity-detector.test.ts apps/desktop/src/viewmodel/agent-command.test.ts",
+    "test:usage": "node --experimental-strip-types --test apps/desktop/src/domain/usage-snapshots.test.ts apps/desktop/src/domain/session-record-sync.test.ts",
     "tauri": "tauri",
     "tauri:dev": "tauri dev --config apps/desktop/src-tauri/tauri.conf.json",
     "tauri:build": "tauri build --config apps/desktop/src-tauri/tauri.conf.json"

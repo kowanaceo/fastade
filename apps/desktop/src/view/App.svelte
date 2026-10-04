@@ -3,6 +3,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { createDesktopClient } from '../application/client-provider';
   import { type CliKind, type WebAgent } from '../domain/session';
+  import { snapshotAge } from '../domain/usage-snapshots';
   import { AppViewModel } from '../viewmodel/app-view-model.svelte';
   import { TauriSessionRecordRepository } from '../infrastructure/tauri-session-record-repository';
   import RemoteFolderPicker from './RemoteFolderPicker.svelte';
@@ -293,7 +294,7 @@
             <small class="usage-clock" title="Local time · UTC">{formatClock(clockNow)} · {formatClock(clockNow, 'UTC')} UTC</small>
             <span aria-hidden="true">{usageOpen ? '⌃' : '⌄'}</span>
           </button>
-          <button title="Refresh usage" aria-label="Refresh usage" onclick={() => void viewModel.refreshAgentUsage()}>↻</button>
+          <button title="Refresh usage" aria-label="Refresh usage" onclick={() => void viewModel.refreshAgentUsage(true)}>↻</button>
         </div>
         {#if usageOpen}
           {#each viewModel.webAgents.filter((agent) => agent.enabled) as agent (agent.id)}
@@ -309,6 +310,14 @@
               {:else}
                 <div class="usage-unavailable"><span>{usage?.message ?? 'Checking…'}</span></div>
               {/if}
+              {#each viewModel.hostUsage.filter((host) => host.agentId === agent.id) as host (host.hostId)}
+                {@const age = snapshotAge(host.collectedAt, Math.floor(clockNow.getTime() / 1000))}
+                <div class="usage-host" class:stale={age.stale} title={`${host.hostLabel} · updated ${age.label}`}>
+                  <span class="usage-host-name">{host.hostLabel}</span>
+                  {#each host.windows as window}<span>{window.label} <b>{window.remainingPercent}%</b></span>{/each}
+                  <small>{age.label}</small>
+                </div>
+              {/each}
             </div>
           {/each}
         {/if}

@@ -215,6 +215,22 @@ pub fn list_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<SessionSum
 /// working directory for helper CLI invocations (like usage lookups) so they
 /// launch somewhere the user has very likely already used Claude Code and
 /// trusted, instead of an unpredictable inherited directory.
+/// SSH endpoints that have a live session, each once, for per-host checks.
+pub fn running_remote_endpoints(state: &AppState) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    if let Ok(sessions) = state.sessions.lock() {
+        for session in sessions.iter() {
+            if session.endpoint != "local"
+                && matches!(session.status, SessionStatus::Running)
+                && !endpoints.contains(&session.endpoint)
+            {
+                endpoints.push(session.endpoint.clone());
+            }
+        }
+    }
+    endpoints
+}
+
 pub fn most_recent_local_path(state: &AppState) -> Option<String> {
     state
         .sessions

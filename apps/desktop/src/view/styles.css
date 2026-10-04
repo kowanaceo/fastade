@@ -81,3 +81,9 @@ button.upload { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #3e5f49; bor
 @media (max-width: 900px) { .session-grid, .session-grid.three, .session-grid.four { grid-template-columns: 1fr; grid-template-rows: none; }.session-grid.three > .session-card:last-child, .session-grid.three > .session-card:not(:last-child) { grid-column: auto; grid-row: auto; }.shell { grid-template-columns: 210px 1fr; } }
 .records-dialog { width: min(760px, 100%); max-height: min(720px, calc(100vh - 48px)); overflow: auto; border: 1px solid #3b4b41; border-radius: 14px; background: #101512; box-shadow: 0 24px 80px #000d; }
 .agent-model-inline input { width: 108px; height: 24px; padding: 0 4px; border: 1px solid #344139; border-radius: 5px; color: #d3dbd6; background: #172019; font-size: 9px; text-transform: none; }
+
+.usage-host { display: flex; align-items: baseline; gap: 8px; margin-top: 3px; padding-left: 13px; color: #78857c; font-size: 9px; white-space: nowrap; }
+.usage-host b { color: #aab6ae; font-weight: 650; }
+.usage-host .usage-host-name { flex: 0 1 auto; overflow: hidden; color: #98a49c; text-overflow: ellipsis; }
+.usage-host small { margin-left: auto; color: #5f6b64; font-size: 8px; }
+.usage-host.stale { opacity: .55; }

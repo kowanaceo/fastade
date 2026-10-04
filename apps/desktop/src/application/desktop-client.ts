@@ -1,4 +1,4 @@
-import type { AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput } from '../domain/session';
+import type { AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
 
 export interface CreateSessionInput {
   title: string;
@@ -61,7 +61,12 @@ export interface DesktopClient {
   reconnectSession(sessionId: string): Promise<CliSessionSummary>;
   closeSession(sessionId: string): Promise<void>;
   openSessionWindow(sessionId: string): Promise<void>;
-  getAgentUsage(agentId: string): Promise<AgentUsage>;
+  /** `force` skips the short-lived cache of Claude's slow-to-read limits. */
+  getAgentUsage(agentId: string, force?: boolean): Promise<AgentUsage>;
+  /** Codex limits of every SSH host with a live session. */
+  getRemoteUsage(): Promise<UsageSnapshot[]>;
+  putUsageSnapshot(snapshot: UsageSnapshot): Promise<void>;
+  listUsageSnapshots(): Promise<unknown>;
   sessionMemoryUsage(): Promise<Record<string, number>>;
   sessionActivityOverrides(): Promise<Record<string, string>>;
   clearSessionActivityOverride(sessionId: string): Promise<void>;

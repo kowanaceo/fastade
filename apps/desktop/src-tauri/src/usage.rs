@@ -3,15 +3,21 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::session::{most_recent_local_path, resolve_program, AppState};
 
-#[derive(Serialize)]
+/// Claude's limits come from driving its TUI, which is slow and fragile, so a
+/// good result is reused for this long unless the user presses refresh.
+const CLAUDE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+static CLAUDE_CACHE: Mutex<Option<(Instant, AgentUsage)>> = Mutex::new(None);
+
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageWindow {
     label: String,
@@ -20,7 +26,7 @@ pub struct UsageWindow {
     reset_text: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentUsage {
     agent_id: String,
@@ -32,9 +38,15 @@ pub struct AgentUsage {
 #[tauri::command]
 pub async fn get_agent_usage(
     agent_id: String,
+    force: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<AgentUsage, String> {
     let requested_id = agent_id.clone();
+    if requested_id == "claude" && !force.unwrap_or(false) {
+        if let Some(cached) = fresh_claude_cache() {
+            return Ok(cached);
+        }
+    }
     // Claude Code's interactive TUI shows a one-time "do you trust this
     // folder?" prompt the first time it runs in a directory, and it can't be
     // answered by this headless probe. Launch it from wherever the user most
@@ -45,7 +57,14 @@ pub async fn get_agent_usage(
     let claude_cwd = most_recent_local_path(&state);
     tauri::async_runtime::spawn_blocking(move || match requested_id.as_str() {
         "codex" => fetch_codex_usage(),
-        "claude" => fetch_claude_usage(claude_cwd),
+        "claude" => fetch_claude_usage(claude_cwd).map(|usage| {
+            if usage.status == "available" {
+                if let Ok(mut cache) = CLAUDE_CACHE.lock() {
+                    *cache = Some((Instant::now(), usage.clone()));
+                }
+            }
+            usage
+        }),
         _ => Ok(AgentUsage {
             agent_id: requested_id,
             status: "unavailable",
@@ -57,7 +76,128 @@ pub async fn get_agent_usage(
     .map_err(|error| error.to_string())?
 }
 
+fn fresh_claude_cache() -> Option<AgentUsage> {
+    let cache = CLAUDE_CACHE.lock().ok()?;
+    let (at, usage) = cache.as_ref()?;
+    (at.elapsed() < CLAUDE_CACHE_TTL).then(|| usage.clone())
+}
+
+/// Codex records its rate limits in every session log it writes, so the
+/// newest log already holds the answer; only when there is none (or it
+/// describes a window that has since reset) is the app-server started.
 fn fetch_codex_usage() -> Result<AgentUsage, String> {
+    if let Some((windows, _)) = codex_log_usage(&codex_sessions_dir()) {
+        return Ok(AgentUsage {
+            agent_id: "codex".to_owned(),
+            status: "available",
+            windows,
+            message: None,
+        });
+    }
+    fetch_codex_usage_from_app_server()
+}
+
+fn codex_sessions_dir() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .unwrap_or_default()
+        .join("sessions")
+}
+
+/// Newest `rollout-*.jsonl` files first. Logs live in `YYYY/MM/DD/`, so
+/// walking the directory names in descending order finds them without
+/// reading the whole history.
+fn newest_rollouts(root: &Path, limit: usize) -> Vec<PathBuf> {
+    fn descending(path: &Path) -> Vec<PathBuf> {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+            .map(|dir| dir.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        entries.sort();
+        entries.reverse();
+        entries
+    }
+    let mut files = Vec::new();
+    for year in descending(root) {
+        for month in descending(&year) {
+            for day in descending(&month) {
+                for file in descending(&day) {
+                    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                        files.push(file);
+                        if files.len() >= limit {
+                            return files;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    files
+}
+
+fn read_tail(path: &Path, bytes: u64) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(bytes))).ok()?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).ok()?;
+    Some(String::from_utf8_lossy(&contents).into_owned())
+}
+
+fn codex_log_usage(root: &Path) -> Option<(Vec<UsageWindow>, i64)> {
+    newest_rollouts(root, 8)
+        .iter()
+        .filter_map(|path| read_tail(path, 256 * 1024))
+        .find_map(|tail| codex_usage_from_log(&tail, now_unix()))
+}
+
+/// The last `token_count` event's rate limits in `text` (a log tail, or the
+/// one line a remote host sends back), as windows plus when it was written.
+/// A window whose reset time has passed is dropped: its percentage describes
+/// a window that no longer exists.
+fn codex_usage_from_log(text: &str, now: i64) -> Option<(Vec<UsageWindow>, i64)> {
+    let event = text.lines().rev().find_map(|line| {
+        if !line.contains("\"rate_limits\"") {
+            return None;
+        }
+        let value: Value = serde_json::from_str(line).ok()?;
+        (value.pointer("/payload/type")?.as_str()? == "token_count"
+            && value.pointer("/payload/rate_limits/primary").is_some())
+        .then_some(value)
+    })?;
+    let limits = event.pointer("/payload/rate_limits")?;
+    let mut windows = Vec::new();
+    for (label, key) in [("5h", "primary"), ("Week", "secondary")] {
+        let value = &limits[key];
+        let used = value.get("used_percent").and_then(Value::as_f64);
+        let resets_at = value.get("resets_at").and_then(Value::as_i64);
+        let (Some(used), Some(resets_at)) = (used, resets_at) else {
+            continue;
+        };
+        if resets_at <= now {
+            continue;
+        }
+        windows.push(UsageWindow {
+            label: label.to_owned(),
+            remaining_percent: (100.0 - used).round().clamp(0.0, 100.0) as i64,
+            resets_at: Some(resets_at),
+            reset_text: None,
+        });
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    let written = event
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+        .map_or(now, |stamp| stamp.timestamp());
+    Some((windows, written))
+}
+
+fn fetch_codex_usage_from_app_server() -> Result<AgentUsage, String> {
     let program =
         resolve_program("codex").ok_or_else(|| "Could not find the Codex CLI.".to_owned())?;
     let mut child = Command::new(program)
@@ -580,12 +720,167 @@ fn terminal_text(value: &str) -> String {
     output
 }
 
+/// One host's limits as of `collected_at`, the unit the account stores so
+/// another device (or this one, later) can show them.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSnapshot {
+    agent_id: String,
+    host_id: String,
+    host_label: String,
+    collected_at: i64,
+    windows: Vec<UsageWindow>,
+}
+
+/// Prints the newest Codex limits line on a host. A unix socket is not needed:
+/// the desktop app runs this over its ordinary ssh exec, so the host stores
+/// nothing and holds no credential.
+const REMOTE_CODEX_SCRIPT: &str = r#"d="${CODEX_HOME:-$HOME/.codex}/sessions"; [ -d "$d" ] || exit 0; find "$d" -name 'rollout-*.jsonl' -type f 2>/dev/null | sort -r | head -8 | while IFS= read -r f; do l=$(tail -c 262144 "$f" | grep '"rate_limits"' | tail -1); if [ -n "$l" ]; then printf '%s\n' "$l"; break; fi; done"#;
+
+/// Stable, URL-safe id for a host the account keys snapshots by.
+pub(crate) fn remote_host_id(endpoint: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(endpoint.as_bytes());
+    let hex: String = digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect();
+    format!("ssh-{hex}")
+}
+
+fn remote_host_label(app: &tauri::AppHandle, endpoint: &str) -> String {
+    endpoint
+        .strip_prefix("managed:")
+        .and_then(|id| crate::servers::resolve_managed_server(app, id).ok())
+        .map(|(server, _)| server.host)
+        .unwrap_or_else(|| endpoint.to_owned())
+}
+
+/// Codex limits for every SSH host with a live session. Claude's limits are
+/// not in its logs, so a remote Claude has nothing to report here.
+#[tauri::command]
+pub async fn get_remote_usage(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<Vec<UsageSnapshot>, String> {
+    let endpoints = crate::session::running_remote_endpoints(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let workers: Vec<_> = endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let app = app.clone();
+                thread::spawn(move || {
+                    let output =
+                        crate::remote_fs::run_remote_script(&endpoint, REMOTE_CODEX_SCRIPT, &app)
+                            .ok()?;
+                    let (windows, collected_at) = codex_usage_from_log(&output, now_unix())?;
+                    Some(UsageSnapshot {
+                        agent_id: "codex".to_owned(),
+                        host_id: remote_host_id(&endpoint),
+                        host_label: remote_host_label(&app, &endpoint),
+                        collected_at,
+                        windows,
+                    })
+                })
+            })
+            .collect();
+        Ok(workers
+            .into_iter()
+            .filter_map(|worker| worker.join().ok().flatten())
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_claude_usage, now_unix, parse_claude_usage, parse_relative_duration,
-        parse_reset_instant, terminal_text,
+        codex_usage_from_log, fetch_claude_usage, newest_rollouts, now_unix, parse_claude_usage,
+        parse_relative_duration, parse_reset_instant, remote_host_id, terminal_text,
     };
+
+    const LOG: &str = concat!(
+        r#"{"timestamp":"2026-10-04T13:00:00.000Z","type":"event_msg","payload":{"type":"agent_message"}}"#, "\n",
+        r#"{"timestamp":"2026-10-04T13:10:00.000Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0,"window_minutes":300,"resets_at":2000},"secondary":{"used_percent":2.0,"window_minutes":10080,"resets_at":9000}}}}"#, "\n",
+        r#"{"timestamp":"2026-10-04T13:14:30.903Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":28.0,"window_minutes":300,"resets_at":2000},"secondary":{"used_percent":4.4,"window_minutes":10080,"resets_at":9000}}}}"#, "\n",
+        r#"{"timestamp":"2026-10-04T13:15:00.000Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#, "\n",
+    );
+
+    #[test]
+    fn codex_limits_come_from_the_last_token_count_with_rate_limits() {
+        let (windows, written) = codex_usage_from_log(LOG, 1000).unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].remaining_percent, 72);
+        assert_eq!(windows[0].resets_at, Some(2000));
+        assert_eq!(windows[1].label, "Week");
+        assert_eq!(windows[1].remaining_percent, 96);
+        assert_eq!(written, 1_791_119_670);
+    }
+
+    #[test]
+    fn a_window_that_already_reset_is_not_reported() {
+        let (windows, _) = codex_usage_from_log(LOG, 3000).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "Week");
+        assert!(codex_usage_from_log(LOG, 9500).is_none());
+        assert!(codex_usage_from_log("not json\n", 0).is_none());
+    }
+
+    #[test]
+    fn rollouts_are_found_newest_first_across_date_folders() {
+        let root = std::env::temp_dir().join(format!("fastade-codex-{}", uuid::Uuid::new_v4()));
+        for (day, name) in [
+            ("2026/09/30", "rollout-2026-09-30T10-00-00-a.jsonl"),
+            ("2026/10/04", "rollout-2026-10-04T08-00-00-b.jsonl"),
+            ("2026/10/04", "rollout-2026-10-04T21-00-00-c.jsonl"),
+            ("2026/10/04", "notes.txt"),
+        ] {
+            let dir = root.join(day);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        let names: Vec<String> = newest_rollouts(&root, 2)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["rollout-2026-10-04T21-00-00-c.jsonl", "rollout-2026-10-04T08-00-00-b.jsonl"]
+        );
+        assert_eq!(newest_rollouts(&root, 10).len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires local Codex session logs; run manually with `cargo test -- --ignored reads_live_codex_log`"]
+    fn reads_live_codex_log() {
+        let (windows, written) = super::codex_log_usage(&super::codex_sessions_dir())
+            .expect("a recent Codex log with unexpired limits");
+        println!("written={written} windows={}", windows.len());
+        for window in &windows {
+            println!("{} {}% resets_at={:?}", window.label, window.remaining_percent, window.resets_at);
+        }
+        assert!(!windows.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires local Codex session logs; verifies the remote script on this machine's sh"]
+    fn remote_script_prints_a_parsable_line() {
+        let output = std::process::Command::new("sh")
+            .args(["-c", super::REMOTE_CODEX_SCRIPT])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(text.lines().count(), 1, "stderr: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(codex_usage_from_log(&text, now_unix()).is_some());
+    }
+
+    #[test]
+    fn remote_host_ids_are_stable_and_url_safe() {
+        let id = remote_host_id("managed:abc");
+        assert_eq!(id, remote_host_id("managed:abc"));
+        assert_ne!(id, remote_host_id("managed:abd"));
+        assert!(id.starts_with("ssh-") && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
 
     #[test]
     fn relative_reset_becomes_seconds() {
