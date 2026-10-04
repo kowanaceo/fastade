@@ -39,7 +39,9 @@
   let collapsedGroups = $state<Record<string, boolean>>({});
   let ungroupedOpen = $state(true);
   let usageOpen = $state(true);
+  let clockNow = $state(new Date());
   let editingAgentId = $state<string | null>(null);
+  let agentEditorOpen = $state(false);
   let agentDraft = $state<WebAgent>(emptyAgent());
   let terminalLayoutRevision = $state(0);
 
@@ -51,11 +53,28 @@
     const selected = agent ?? emptyAgent();
     editingAgentId = agent?.id ?? null;
     agentDraft = { ...selected };
+    agentEditorOpen = Boolean(agent);
+  }
+
+  function addAgent(): void {
+    editingAgentId = null;
+    agentDraft = emptyAgent();
+    agentEditorOpen = true;
+  }
+
+  function closeAgentEditor(): void {
+    editingAgentId = null;
+    agentDraft = emptyAgent();
+    agentEditorOpen = false;
   }
 
   function saveAgent(): void {
     viewModel.saveWebAgent({ ...agentDraft, id: editingAgentId ?? agentDraft.id });
-    editAgent();
+    closeAgentEditor();
+  }
+
+  function formatClock(date: Date, timeZone?: string): string {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false, timeZone });
   }
 
   function formatReset(timestamp?: number): string {
@@ -211,6 +230,7 @@
     let disposed = false;
     let terminalLayoutFrame = 0;
     const nativeWindowUnlisteners: Array<() => void> = [];
+    const clockInterval = window.setInterval(() => { clockNow = new Date(); }, 30_000);
     const notifyTerminalLayoutChanged = (): void => {
       cancelAnimationFrame(terminalLayoutFrame);
       terminalLayoutFrame = requestAnimationFrame(() => { terminalLayoutRevision += 1; });
@@ -230,6 +250,7 @@
     void viewModel.load({ auxiliaryWindow: Boolean(poppedSessionId) });
     return () => {
       disposed = true;
+      window.clearInterval(clockInterval);
       cancelAnimationFrame(terminalLayoutFrame);
       nativeWindowUnlisteners.forEach((unlisten) => unlisten());
       window.removeEventListener('keydown', handleGlobalKeydown, { capture: true });
@@ -249,13 +270,15 @@
       <header class="brand">
         <span class="brand-word"><em>fast</em>ade</span>
         <span class="brand-version">v{__APP_VERSION__}</span>
-        <button class="icon-button settings-button" onclick={() => viewModel.toggleSettings()} aria-label="AI agent settings" title="AI agent settings">⚙</button>
+        <button class="icon-button settings-button" class:authenticated={viewModel.authenticated} onclick={() => viewModel.toggleSettings()} aria-label="Settings" title={viewModel.authenticated ? 'Settings · signed in' : 'Settings'}>⚙</button>
         <button class="icon-button drawer-close" onclick={() => viewModel.toggleDrawer()} aria-label="Close drawer">‹</button>
       </header>
       <section class="agent-status-panel" aria-label="AI usage">
         <div class="agent-status-heading">
           <button class="section-heading" aria-expanded={usageOpen} onclick={() => { usageOpen = !usageOpen; }}>
-            <span>AI USAGE</span><span aria-hidden="true">{usageOpen ? '⌃' : '⌄'}</span>
+            <span>AI USAGE</span>
+            <small class="usage-clock" title="Local time · UTC">{formatClock(clockNow)} · {formatClock(clockNow, 'UTC')} UTC</small>
+            <span aria-hidden="true">{usageOpen ? '⌃' : '⌄'}</span>
           </button>
           <button title="Refresh usage" aria-label="Refresh usage" onclick={() => void viewModel.refreshAgentUsage()}>↻</button>
         </div>
@@ -329,6 +352,13 @@
                 <strong>{group.name}</strong>
                 <span class="group-count" aria-label={`${group.entries.length} sessions`}>{group.entries.length}</span>
               </button>
+              <button
+                class="group-collapse-target"
+                aria-expanded={!isGroupCollapsed(group.id)}
+                aria-label={`${isGroupCollapsed(group.id) ? 'Expand' : 'Collapse'} ${group.name} sessions`}
+                title={`${isGroupCollapsed(group.id) ? 'Expand' : 'Collapse'} sessions`}
+                onclick={() => toggleGroup(group.id)}
+              ></button>
               <div class="group-actions">
                 <button
                   class="group-toggle"
@@ -512,8 +542,26 @@
 
 {#if viewModel.settingsOpen}
   <div class="settings-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) viewModel.toggleSettings(); }}>
-    <div class="settings-panel" role="dialog" aria-modal="true" aria-label="AI agent settings">
-      <header><div><strong>AI agents</strong><small>Manage web chat and usage pages.</small></div><button class="icon-button" aria-label="Close settings" onclick={() => viewModel.toggleSettings()}>×</button></header>
+    <div class="settings-panel" role="dialog" aria-modal="true" aria-label="Settings">
+      <header><div><strong>Settings</strong><small>Manage your account and AI agents.</small></div><button class="icon-button" aria-label="Close settings" onclick={() => viewModel.toggleSettings()}>×</button></header>
+      <section class="account-settings" aria-label="Account">
+        <div class="account-copy">
+          <span class="account-avatar" class:signed-in={viewModel.authenticated}>{viewModel.authenticated ? viewModel.authUser?.name.slice(0, 1).toUpperCase() : 'G'}</span>
+          <span>
+            <strong>{viewModel.authUser?.name ?? 'Sign in to fastade'}</strong>
+            <small>{viewModel.authUser?.email ?? 'Sync your session information across devices.'}</small>
+          </span>
+        </div>
+        {#if viewModel.authenticated}
+          <button type="button" class="account-action" disabled={viewModel.authBusy} onclick={() => void viewModel.signOut()}>{viewModel.authBusy ? 'Signing out…' : 'Sign out'}</button>
+        {:else}
+          <button type="button" class="google-login" disabled={!viewModel.googleLoginConfigured || viewModel.authBusy} title={viewModel.googleLoginConfigured ? 'Continue with Google' : 'Google OAuth is not configured'} onclick={() => void viewModel.signInWithGoogle()}>
+            <span aria-hidden="true">G</span> {viewModel.authBusy ? 'Waiting for Google…' : 'Continue with Google'}
+          </button>
+        {/if}
+        {#if viewModel.authError}<p class="account-note error-note">{viewModel.authError}</p>{:else if !viewModel.googleLoginConfigured}<p class="account-note">Add a Google Desktop OAuth client to enable login.</p>{/if}
+      </section>
+      <div class="settings-section-heading"><strong>AI agents</strong><small>Manage web chat and usage pages.</small></div>
       <div class="agent-settings-list">
         {#each viewModel.webAgents as agent (agent.id)}
           <div class="agent-setting-row">
@@ -546,14 +594,18 @@
           </div>
         {/each}
       </div>
-      <form class="agent-editor" onsubmit={(event) => { event.preventDefault(); saveAgent(); }}>
-        <p>{editingAgentId ? 'Edit agent' : 'Add agent'}</p>
-        <label>Name<input bind:value={agentDraft.name} placeholder="Perplexity" required /></label>
-        <label>Color<input class="color-input" type="color" bind:value={agentDraft.accent} /></label>
-        <label class="wide">Chat URL<input bind:value={agentDraft.chatUrl} type="url" placeholder="https://…" required /></label>
-        <label class="wide">Usage URL<input bind:value={agentDraft.usageUrl} type="url" placeholder="Optional" /></label>
-        <div class="editor-actions wide">{#if editingAgentId}<button type="button" onclick={() => editAgent()}>Cancel</button>{/if}<button class="primary" type="submit">{editingAgentId ? 'Save agent' : 'Add agent'}</button></div>
-      </form>
+      {#if agentEditorOpen}
+        <form class="agent-editor" onsubmit={(event) => { event.preventDefault(); saveAgent(); }}>
+          <p>{editingAgentId ? 'Edit agent' : 'New agent'}</p>
+          <label>Name<input bind:value={agentDraft.name} placeholder="Perplexity" required /></label>
+          <label>Color<input class="color-input" type="color" bind:value={agentDraft.accent} /></label>
+          <label class="wide">Chat URL<input bind:value={agentDraft.chatUrl} type="url" placeholder="https://…" required /></label>
+          <label class="wide">Usage URL<input bind:value={agentDraft.usageUrl} type="url" placeholder="Optional" /></label>
+          <div class="editor-actions wide"><button type="button" onclick={closeAgentEditor}>Cancel</button><button class="primary" type="submit">OK</button></div>
+        </form>
+      {:else}
+        <div class="add-agent-action"><button type="button" onclick={addAgent}><span aria-hidden="true">+</span> Add agent</button></div>
+      {/if}
     </div>
   </div>
 {/if}

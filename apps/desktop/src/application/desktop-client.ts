@@ -1,4 +1,4 @@
-import type { AgentUsage, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, UpdateServerInput } from '../domain/session';
+import type { AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput } from '../domain/session';
 
 export interface CreateSessionInput {
   title: string;
@@ -34,6 +34,7 @@ export interface DesktopClient {
   rememberSavedSessionPath(id: string, endpoint: string, projectPath: string): Promise<SavedSessionProfile>;
   updateSavedSession(id: string, name: string, endpoint: string, projectPath: string): Promise<SavedSessionProfile>;
   deleteSavedSession(id: string): Promise<void>;
+  replaceSavedSessions(profiles: SavedSessionProfile[]): Promise<void>;
   listSshHosts(): Promise<SshHost[]>;
   listManagedServers(): Promise<ManagedServer[]>;
   createManagedServer(input: CreateServerInput): Promise<CreatedServer>;
@@ -61,4 +62,10 @@ export interface DesktopClient {
   clearSessionActivityOverride(sessionId: string): Promise<void>;
   getMcpAgentStatus(cli: CliKind): Promise<boolean>;
   setMcpAgentEnabled(cli: CliKind, enabled: boolean): Promise<void>;
+  googleAuthStatus(): Promise<AuthStatus>;
+  googleSignIn(): Promise<AuthUser>;
+  googleSignOut(): Promise<void>;
+  syncSnapshot(): Promise<SyncSnapshot>;
+  syncChanges(cursor: number, limit?: number, waitSeconds?: number): Promise<SyncChangesResponse>;
+  syncPush(changes: SyncPushChange[]): Promise<SyncPushResponse>;
 }

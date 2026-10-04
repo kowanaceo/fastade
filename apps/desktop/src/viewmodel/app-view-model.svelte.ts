@@ -1,5 +1,5 @@
 import type { DesktopClient, SshHost, TerminalEvent } from '../application/desktop-client';
-import { type AgentUsage, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type UpdateServerInput, type WebAgent } from '../domain/session';
+import { type AgentUsage, type AuthUser, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type SyncEntity, type SyncPushChange, type UpdateServerInput, type WebAgent } from '../domain/session';
 import { detectAgentActivity, type AgentActivity } from './activity-detector';
 
 type TerminalSink = (data: string, replay?: boolean) => void;
@@ -32,12 +32,20 @@ export interface SessionGroupEntry {
  * is running in this session's shell right now. */
 interface GroupDefinition { id: string; name: string; }
 interface ShellInputActions { launchedAgent: CliKind | null; }
+interface SyncedRecord { version: number; hash: string; }
+interface SessionSyncState {
+  cursor: number;
+  profiles: Record<string, SyncedRecord>;
+  devicePaths: Record<string, SyncedRecord>;
+}
 
 const UNGROUPED_ID = 'ungrouped';
 const DEFAULT_GROUP_NAME = 'Sessions';
 const GROUPS_STORAGE_KEY = 'fastade.session-groups.v1';
 const WEB_AGENTS_STORAGE_KEY = 'fastade.web-agents.v1';
 const AGENT_MODELS_STORAGE_KEY = 'fastade.agent-default-models.v1';
+const SESSION_SYNC_STORAGE_KEY = 'fastade.session-sync.v1';
+const SESSION_SYNC_OWNER_KEY = 'fastade.session-sync-owner.v1';
 const FONT_SIZE_STORAGE_KEY = 'fastade.terminal-font-size.v1';
 const DEFAULT_FONT_SIZE = 11;
 const MIN_FONT_SIZE = 8;
@@ -84,6 +92,11 @@ export class AppViewModel {
   loading = $state(false);
   error = $state<string | null>(null);
   settingsOpen = $state(false);
+  authUser = $state<AuthUser | null>(null);
+  authDeviceId = $state<string | null>(null);
+  googleLoginConfigured = $state(false);
+  authBusy = $state(false);
+  authError = $state<string | null>(null);
   webAgents = $state<WebAgent[]>(DEFAULT_WEB_AGENTS.map((agent) => ({ ...agent })));
   agentUsage = $state<Record<string, AgentUsage>>({});
   agentDefaultModels = $state<Record<CliKind, string>>({ codex: '', claude: '', gemini: '' });
@@ -104,6 +117,45 @@ export class AppViewModel {
    * see `activityFor`. Only present for sessions whose CLI has hooks wired
    * up; absent for the rest, which fall back to the heuristic. */
   activityOverrides = $state<Record<string, string>>({});
+  private sessionSyncPromise?: Promise<void>;
+  private sessionSyncPending = false;
+  private syncLoopGeneration = 0;
+  private allowSyncLoop = false;
+
+  get authenticated(): boolean { return this.authUser !== null; }
+
+  async signInWithGoogle(): Promise<void> {
+    if (!this.googleLoginConfigured || this.authBusy) return;
+    this.authBusy = true;
+    this.authError = null;
+    try {
+      this.authUser = await this.client.googleSignIn();
+      const status = await this.client.googleAuthStatus();
+      this.authDeviceId = status.deviceId ?? null;
+      await this.syncSessionInformation();
+      this.startSessionSyncLoop();
+    } catch (error) {
+      this.authError = this.message(error);
+    } finally {
+      this.authBusy = false;
+    }
+  }
+
+  async signOut(): Promise<void> {
+    if (this.authBusy) return;
+    this.authBusy = true;
+    this.authError = null;
+    this.syncLoopGeneration += 1;
+    try {
+      await this.client.googleSignOut();
+      this.authUser = null;
+      this.authDeviceId = null;
+    } catch (error) {
+      this.authError = this.message(error);
+    } finally {
+      this.authBusy = false;
+    }
+  }
   remoteBrowser = $state<{ endpoint: string; sessionId: string } | null>(null);
   /** Session ids with an upload in flight, for the status line's spinner. */
   uploadingFiles = $state<Record<string, boolean>>({});
@@ -261,18 +313,20 @@ export class AppViewModel {
   }
 
   async load(options: { auxiliaryWindow?: boolean } = {}): Promise<void> {
+    this.allowSyncLoop = !options.auxiliaryWindow;
     this.loading = true;
     this.error = null;
     try {
       this.restoreWebAgents();
       this.restoreAgentDefaultModels();
       this.unsubscribeTerminal ??= await this.client.subscribeToTerminal((event) => this.handleTerminalEvent(event));
-      const [cliSessions, savedSessions, sshHosts, managedServers, homeDirectory] = await Promise.all([
+      const [cliSessions, savedSessions, sshHosts, managedServers, homeDirectory, authStatus] = await Promise.all([
         this.client.listSessions(),
         this.client.listSavedSessions(),
         this.client.listSshHosts(),
         this.client.listManagedServers(),
         this.client.getHomeDirectory().catch(() => null),
+        this.client.googleAuthStatus(),
       ]);
       this.sessions = cliSessions;
       this.restoreRunningAgentState(cliSessions);
@@ -280,8 +334,15 @@ export class AppViewModel {
       this.sshHosts = sshHosts;
       this.managedServers = managedServers;
       this.homeDirectory = homeDirectory ?? '';
+      this.googleLoginConfigured = authStatus.configured;
+      this.authUser = authStatus.user ?? null;
+      this.authDeviceId = authStatus.deviceId ?? null;
       this.restoreGroups();
       await this.ensureGroupedProfiles();
+      if (this.authenticated) {
+        await this.syncSessionInformation();
+        this.startSessionSyncLoop();
+      }
       if (!options.auxiliaryWindow) await this.restorePinnedSessions();
       const requested = new URLSearchParams(window.location.search).get('session');
       this.selectedSessionId = requested ?? this.sessions[0]?.id ?? null;
@@ -308,6 +369,7 @@ export class AppViewModel {
   }
 
   dispose(): void {
+    this.syncLoopGeneration += 1;
     this.unsubscribeTerminal?.();
     this.unsubscribeTerminal = undefined;
     this.terminalSinks.clear();
@@ -574,6 +636,7 @@ export class AppViewModel {
       this.savedSessions = [...this.savedSessions, saved];
       this.sessionProfileIds = { ...this.sessionProfileIds, [session.id]: saved.id };
       this.persistGroups();
+      void this.syncSessionInformation();
     } catch (error) { this.error = this.message(error); }
   }
 
@@ -675,6 +738,7 @@ export class AppViewModel {
         this.sessionProfileIds = Object.fromEntries(Object.entries(this.sessionProfileIds).filter(([, id]) => id !== profileId));
         this.profileGroupIds = Object.fromEntries(Object.entries(this.profileGroupIds).filter(([id]) => id !== profileId));
         this.persistGroups();
+        void this.syncSessionInformation();
       } catch (error) { this.error = this.message(error); }
       return;
     }
@@ -842,6 +906,7 @@ export class AppViewModel {
       this.savedSessions = this.savedSessions.filter((profile) => profile.id !== id);
       this.sessionProfileIds = Object.fromEntries(Object.entries(this.sessionProfileIds).filter(([, profileId]) => profileId !== id));
       this.persistGroups();
+      void this.syncSessionInformation();
     } catch (error) { this.error = this.message(error); }
   }
 
@@ -1112,6 +1177,7 @@ export class AppViewModel {
       projectPath: session.projectPath,
     });
     this.savedSessions = [...this.savedSessions, saved];
+    void this.syncSessionInformation();
     return saved;
   }
 
@@ -1163,6 +1229,213 @@ export class AppViewModel {
     return path === '~'
       || (session.endpoint === 'local' && path === this.homeDirectory)
       || this.shellHomes.get(session.id) === path;
+  }
+
+  /** Reconciles durable session profiles with the account snapshot. Live PTYs,
+   * transcripts and activity never enter this path. Local edits are detected
+   * against the last server version/hash, so a clean local copy accepts a
+   * newer remote version while an edited copy is pushed. */
+  private async syncSessionInformation(): Promise<void> {
+    if (!this.authUser || !this.authDeviceId) return;
+    if (this.sessionSyncPromise) {
+      this.sessionSyncPending = true;
+      return this.sessionSyncPromise;
+    }
+    this.sessionSyncPromise = this.runSessionSync();
+    try {
+      await this.sessionSyncPromise;
+    } catch (error) {
+      this.authError = `Session sync failed: ${this.message(error)}`;
+    } finally {
+      this.sessionSyncPromise = undefined;
+      if (this.sessionSyncPending) {
+        this.sessionSyncPending = false;
+        void this.syncSessionInformation();
+      }
+    }
+  }
+
+  private async runSessionSync(): Promise<void> {
+    const user = this.authUser;
+    const deviceId = this.authDeviceId;
+    if (!user || !deviceId) return;
+
+    const owner = localStorage.getItem(SESSION_SYNC_OWNER_KEY);
+    const mayMigrateLocal = owner === null || owner === user.id;
+    const previous = this.readSessionSyncState(user.id);
+    let snapshot = await this.client.syncSnapshot();
+    const remote = this.activeSyncEntities(snapshot.entities);
+    const local = await this.localSessionEntities(deviceId);
+    const changes: SyncPushChange[] = [];
+
+    for (const [id, value] of local.profiles) {
+      const record = previous.profiles[id];
+      const remoteEntity = remote.profiles.get(id);
+      const dirty = record ? record.hash !== value.hash : !remoteEntity && mayMigrateLocal;
+      if (dirty) changes.push(this.upsertChange('profile', id, value.payload, record?.version));
+    }
+    for (const [id, value] of local.devicePaths) {
+      const record = previous.devicePaths[id];
+      const remoteEntity = remote.devicePaths.get(id);
+      const dirty = record ? record.hash !== value.hash : !remoteEntity && mayMigrateLocal;
+      if (dirty) changes.push(this.upsertChange('device_path', id, value.payload, record?.version));
+    }
+    for (const [id, record] of Object.entries(previous.profiles)) {
+      if (!local.profiles.has(id)) changes.push(this.deleteChange('profile', id, record.version));
+    }
+    for (const [id, record] of Object.entries(previous.devicePaths)) {
+      if (!local.devicePaths.has(id)) changes.push(this.deleteChange('device_path', id, record.version));
+    }
+
+    if (changes.length) {
+      const response = await this.client.syncPush(changes);
+      const rejected = response.results.filter((result) => result.status === 'rejected');
+      if (rejected.length) throw new Error(rejected.map((result) => `${result.entityType}:${result.entityId}: ${result.reason ?? 'rejected'}`).join('; '));
+      snapshot = await this.client.syncSnapshot();
+    }
+
+    const finalRemote = this.activeSyncEntities(snapshot.entities);
+    const profiles = this.profilesFromSnapshot(finalRemote.profiles, finalRemote.devicePaths, deviceId);
+    await this.client.replaceSavedSessions(profiles);
+    this.savedSessions = profiles;
+    this.pruneProfileLinks(new Set(profiles.map((profile) => profile.id)));
+    this.writeSessionSyncState(user.id, snapshot.cursor, finalRemote.profiles, finalRemote.devicePaths);
+    localStorage.setItem(SESSION_SYNC_OWNER_KEY, user.id);
+    this.authError = null;
+  }
+
+  private async localSessionEntities(deviceId: string): Promise<{
+    profiles: Map<string, { payload: Record<string, unknown>; hash: string }>;
+    devicePaths: Map<string, { payload: Record<string, unknown>; hash: string }>;
+  }> {
+    const profiles = new Map<string, { payload: Record<string, unknown>; hash: string }>();
+    const devicePaths = new Map<string, { payload: Record<string, unknown>; hash: string }>();
+    for (const profile of this.savedSessions) {
+      const payload = { name: profile.name, lastEndpoint: profile.lastEndpoint };
+      profiles.set(profile.id, { payload, hash: JSON.stringify(payload) });
+      for (const [endpoint, projectPath] of Object.entries(profile.devicePaths)) {
+        const pathPayload = { profileId: profile.id, deviceId, endpoint, projectPath };
+        const id = await this.devicePathEntityId(profile.id, deviceId, endpoint);
+        devicePaths.set(id, { payload: pathPayload, hash: JSON.stringify(pathPayload) });
+      }
+    }
+    return { profiles, devicePaths };
+  }
+
+  private activeSyncEntities(entities: SyncEntity[]): {
+    profiles: Map<string, SyncEntity>;
+    devicePaths: Map<string, SyncEntity>;
+  } {
+    const profiles = new Map<string, SyncEntity>();
+    const devicePaths = new Map<string, SyncEntity>();
+    for (const entity of entities) {
+      if (entity.deleted) continue;
+      if (entity.entityType === 'profile') profiles.set(entity.entityId, entity);
+      if (entity.entityType === 'device_path') devicePaths.set(entity.entityId, entity);
+    }
+    return { profiles, devicePaths };
+  }
+
+  private profilesFromSnapshot(
+    profileEntities: Map<string, SyncEntity>,
+    pathEntities: Map<string, SyncEntity>,
+    deviceId: string,
+  ): SavedSessionProfile[] {
+    const paths = new Map<string, Array<{ endpoint: string; projectPath: string; current: boolean }>>();
+    for (const entity of pathEntities.values()) {
+      const profileId = typeof entity.payload.profileId === 'string' ? entity.payload.profileId : '';
+      const endpoint = typeof entity.payload.endpoint === 'string' ? entity.payload.endpoint : '';
+      const projectPath = typeof entity.payload.projectPath === 'string'
+        ? entity.payload.projectPath
+        : typeof entity.payload.path === 'string' ? entity.payload.path : '';
+      if (!profileId || !endpoint || !projectPath) continue;
+      const values = paths.get(profileId) ?? [];
+      values.push({ endpoint, projectPath, current: entity.updatedByDevice === deviceId || entity.payload.deviceId === deviceId });
+      paths.set(profileId, values);
+    }
+    return [...profileEntities.values()].flatMap((entity) => {
+      const name = typeof entity.payload.name === 'string' ? entity.payload.name.trim() : '';
+      const lastEndpoint = typeof entity.payload.lastEndpoint === 'string' ? entity.payload.lastEndpoint.trim() : '';
+      if (!name || !lastEndpoint) return [];
+      const devicePaths: Record<string, string> = {};
+      const values = paths.get(entity.entityId) ?? [];
+      for (const value of values.filter((item) => !item.current)) devicePaths[value.endpoint] = value.projectPath;
+      for (const value of values.filter((item) => item.current)) devicePaths[value.endpoint] = value.projectPath;
+      // Accept snapshots written by an early client that kept paths inside the
+      // profile payload, while always writing the normalized device_path form.
+      if (!Object.keys(devicePaths).length && entity.payload.devicePaths && typeof entity.payload.devicePaths === 'object') {
+        Object.assign(devicePaths, entity.payload.devicePaths);
+      }
+      return [{ id: entity.entityId, name, lastEndpoint, devicePaths }];
+    });
+  }
+
+  private upsertChange(entityType: 'profile' | 'device_path', entityId: string, payload: Record<string, unknown>, baseVersion?: number): SyncPushChange {
+    return { changeId: crypto.randomUUID(), entityType, entityId, operation: 'upsert', ...(baseVersion === undefined ? {} : { baseVersion }), payload };
+  }
+
+  private deleteChange(entityType: 'profile' | 'device_path', entityId: string, baseVersion: number): SyncPushChange {
+    return { changeId: crypto.randomUUID(), entityType, entityId, operation: 'delete', baseVersion, payload: {} };
+  }
+
+  private async devicePathEntityId(profileId: string, deviceId: string, endpoint: string): Promise<string> {
+    // The sync API requires UUID entity IDs. Derive one deterministically so
+    // the same profile/device/endpoint always upserts the same device_path
+    // instead of creating duplicates after an app restart.
+    const input = new TextEncoder().encode(`fastade-device-path:${profileId}:${deviceId}:${endpoint}`);
+    const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', input)).slice(0, 16);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+
+  private readSessionSyncState(userId: string): SessionSyncState {
+    try {
+      const users = JSON.parse(localStorage.getItem(SESSION_SYNC_STORAGE_KEY) ?? '{}') as Record<string, SessionSyncState>;
+      const state = users[userId];
+      return { cursor: state?.cursor ?? 0, profiles: state?.profiles ?? {}, devicePaths: state?.devicePaths ?? {} };
+    } catch {
+      return { cursor: 0, profiles: {}, devicePaths: {} };
+    }
+  }
+
+  private writeSessionSyncState(userId: string, cursor: number, profiles: Map<string, SyncEntity>, devicePaths: Map<string, SyncEntity>): void {
+    let users: Record<string, SessionSyncState> = {};
+    try { users = JSON.parse(localStorage.getItem(SESSION_SYNC_STORAGE_KEY) ?? '{}') as Record<string, SessionSyncState>; } catch { /* replace corrupt metadata */ }
+    users[userId] = {
+      cursor,
+      profiles: Object.fromEntries([...profiles].map(([id, entity]) => [id, { version: entity.version, hash: JSON.stringify({ name: entity.payload.name, lastEndpoint: entity.payload.lastEndpoint }) }])),
+      devicePaths: Object.fromEntries([...devicePaths].map(([id, entity]) => [id, { version: entity.version, hash: JSON.stringify({ profileId: entity.payload.profileId, deviceId: entity.payload.deviceId, endpoint: entity.payload.endpoint, projectPath: entity.payload.projectPath }) }])),
+    };
+    localStorage.setItem(SESSION_SYNC_STORAGE_KEY, JSON.stringify(users));
+  }
+
+  private startSessionSyncLoop(): void {
+    if (!this.allowSyncLoop || !this.authenticated) return;
+    const generation = ++this.syncLoopGeneration;
+    void (async () => {
+      while (generation === this.syncLoopGeneration && this.authenticated) {
+        try {
+          const userId = this.authUser?.id;
+          if (!userId) return;
+          const cursor = this.readSessionSyncState(userId).cursor;
+          const response = await this.client.syncChanges(cursor, 500, 25);
+          if (generation !== this.syncLoopGeneration) return;
+          if (response.changes.length || response.hasMore) await this.syncSessionInformation();
+        } catch {
+          // Offline and transient server failures are expected. The durable
+          // local projection remains usable and the loop resumes shortly.
+          await new Promise((resolve) => setTimeout(resolve, 5_000));
+        }
+      }
+    })();
+  }
+
+  private pruneProfileLinks(profileIds: Set<string>): void {
+    this.profileGroupIds = Object.fromEntries(Object.entries(this.profileGroupIds).filter(([id]) => profileIds.has(id)));
+    this.sessionProfileIds = Object.fromEntries(Object.entries(this.sessionProfileIds).filter(([, id]) => profileIds.has(id)));
+    this.persistGroups();
   }
 
   private restoreGroups(): void {
@@ -1221,6 +1494,7 @@ export class AppViewModel {
       if (profileId) {
         const profile = await this.client.updateSavedSession(profileId, title, updated.endpoint, projectPath);
         this.savedSessions = this.savedSessions.map((item) => item.id === profile.id ? profile : item);
+        void this.syncSessionInformation();
       }
       const current = this.sessions.find((session) => session.id === sessionId);
       if (current?.projectPath === projectPath) {
