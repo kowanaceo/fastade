@@ -47,6 +47,8 @@ export interface DesktopClient {
   selectFiles(defaultPath?: string): Promise<string[]>;
   uploadFileToSession(sessionId: string, sourcePath: string): Promise<string>;
   subscribeToTerminal(handler: (event: TerminalEvent) => void): Promise<() => void>;
+  /** Notes or tasks changed outside the window, e.g. through the MCP bridge. */
+  subscribeToRecordChanges(handler: () => void): Promise<() => void>;
   createSession(input: CreateSessionInput): Promise<CliSessionSummary>;
   writeTerminal(sessionId: string, data: string): Promise<void>;
   resizeTerminal(sessionId: string, cols: number, rows: number): Promise<void>;

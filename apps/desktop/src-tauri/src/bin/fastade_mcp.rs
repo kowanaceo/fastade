@@ -73,8 +73,72 @@ fn tool_definitions() -> Value {
             "name": "list_projects",
             "description": "Return every project shown in fastade, one entry per saved project, with its name, current endpoint, project path, and paths remembered for other devices.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "list_records",
+            "description": "List notes (memos) and tasks attached to saved fastade sessions. Without profile_id it returns the records of the session this agent is running in, or every record when called outside a fastade session. Each record has id, profileId, kind (note|task), title, content and, for tasks, status (todo|in progress|done).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "profile_id": { "type": "string", "description": "A saved session's profileId from list_sessions." }
+                }
+            }
+        },
+        {
+            "name": "create_record",
+            "description": "Create a note (memo) or task on a saved fastade session. Defaults to the session this agent is running in; pass profile_id to target another. A task starts as todo unless a status is given.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["note", "task"] },
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "status": { "type": "string", "enum": ["todo", "in progress", "done"], "description": "Tasks only." },
+                    "profile_id": { "type": "string" }
+                },
+                "required": ["kind", "title"]
+            }
+        },
+        {
+            "name": "update_record",
+            "description": "Change a note's or task's title, content or (tasks only) status. Omitted fields are left as they are; the kind cannot change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "status": { "type": "string", "enum": ["todo", "in progress", "done"] }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "delete_record",
+            "description": "Delete a note or task by id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
         }
     ])
+}
+
+/// Notes and tasks only: session control (sending input, stopping agents)
+/// stays out of MCP on purpose.
+const RECORD_TOOLS: [&str; 4] = ["list_records", "create_record", "update_record", "delete_record"];
+
+/// The tool arguments plus the caller's own fastade session, so a record
+/// lands on the session the agent is working in without it knowing any ids.
+fn record_request(name: &str, arguments: &Value) -> Value {
+    let mut request = arguments.as_object().cloned().unwrap_or_default();
+    request.insert("op".to_owned(), json!(name));
+    request.remove("session_id");
+    if let Ok(session_id) = std::env::var("FASTADE_SESSION_ID") {
+        request.insert("session_id".to_owned(), json!(session_id));
+    }
+    Value::Object(request)
 }
 
 fn call_tool(params: Value) -> Result<Value, Value> {
@@ -85,6 +149,9 @@ fn call_tool(params: Value) -> Result<Value, Value> {
     let request = match name {
         "list_sessions" => json!({ "op": "list_sessions" }),
         "list_projects" => json!({ "op": "list_projects" }),
+        record if RECORD_TOOLS.contains(&record) => {
+            record_request(record, params.get("arguments").unwrap_or(&Value::Null))
+        }
         other => {
             return Err(json!({ "code": -32602, "message": format!("unknown tool: {other}") }))
         }
@@ -92,7 +159,11 @@ fn call_tool(params: Value) -> Result<Value, Value> {
 
     let response =
         send_to_app(&request).map_err(|error| json!({ "code": -32000, "message": error }))?;
-    Ok(json!({ "content": [{ "type": "text", "text": response.to_string() }] }))
+    let failed = response.get("ok") == Some(&Value::Bool(false));
+    Ok(json!({
+        "content": [{ "type": "text", "text": response.to_string() }],
+        "isError": failed,
+    }))
 }
 
 /// Claude Code's AskUserQuestion arrives as an ordinary PreToolUse (mapped to
@@ -201,8 +272,13 @@ fn read_effective_model(path: &str) -> Option<String> {
 fn send_to_app(request: &Value) -> Result<Value, String> {
     use std::os::unix::net::UnixStream;
 
-    let path = fastade_desktop_lib::mcp::socket_path()
-        .ok_or_else(|| "could not determine the fastade app's data directory".to_owned())?;
+    // A remote host reaches the desktop app through an ssh-forwarded socket
+    // whose path fastade puts in $FASTADE_SOCK when it opens the session.
+    let path = match std::env::var_os("FASTADE_SOCK").filter(|value| !value.is_empty()) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => fastade_desktop_lib::mcp::socket_path()
+            .ok_or_else(|| "could not determine the fastade app's data directory".to_owned())?,
+    };
     let mut stream = UnixStream::connect(&path)
         .map_err(|_| "the fastade desktop app is not running".to_owned())?;
     let mut payload = request.to_string();
@@ -230,16 +306,37 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn exposes_only_read_only_listing_tools() {
+    fn exposes_listing_and_record_tools_but_no_session_control() {
         let tools = tool_definitions();
         let tools = tools.as_array().expect("tool definitions must be an array");
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["name"], "list_sessions");
-        assert_eq!(tools[1]["name"], "list_projects");
+        let names: Vec<_> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "list_sessions",
+                "list_projects",
+                "list_records",
+                "create_record",
+                "update_record",
+                "delete_record"
+            ]
+        );
 
         let error = call_tool(json!({ "name": "send_message", "arguments": {} }))
             .expect_err("removed mutation tools must stay unavailable");
         assert_eq!(error["code"], -32602);
+    }
+
+    #[test]
+    fn record_requests_carry_the_op_and_ignore_a_spoofed_session() {
+        let request = record_request(
+            "create_record",
+            &json!({ "kind": "note", "title": "t", "session_id": "attacker" }),
+        );
+        assert_eq!(request["op"], "create_record");
+        assert_eq!(request["title"], "t");
+        assert_ne!(request["session_id"], "attacker");
+        assert_eq!(record_request("list_records", &Value::Null)["op"], "list_records");
     }
 
     #[test]

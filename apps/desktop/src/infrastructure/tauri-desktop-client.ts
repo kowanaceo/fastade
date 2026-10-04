@@ -85,6 +85,10 @@ export class TauriDesktopClient implements DesktopClient {
     return listen<TerminalEvent>('terminal-event', (event) => handler(event.payload));
   }
 
+  async subscribeToRecordChanges(handler: () => void): Promise<() => void> {
+    return listen('records-changed', () => handler());
+  }
+
   createSession(input: CreateSessionInput): Promise<CliSessionSummary> {
     return invoke<CliSessionSummary>('create_session', { input });
   }

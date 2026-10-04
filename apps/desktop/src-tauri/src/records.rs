@@ -91,12 +91,20 @@ pub fn create_session_record(
     draft: SessionRecordDraft,
     app: tauri::AppHandle,
 ) -> Result<SessionRecord, String> {
+    create_record(&app, profile_id, draft)
+}
+
+fn create_record(
+    app: &tauri::AppHandle,
+    profile_id: String,
+    draft: SessionRecordDraft,
+) -> Result<SessionRecord, String> {
     if profile_id.trim().is_empty() {
         return Err("A saved session is required.".to_owned());
     }
     let valid = validate(draft)?;
     let _guard = STORE_LOCK.lock().map_err(|error| error.to_string())?;
-    let path = records_path(&app)?;
+    let path = records_path(app)?;
     let mut records = read_records(&path)?;
     let now = now_millis();
     let record = SessionRecord {
@@ -120,14 +128,24 @@ pub fn update_session_record(
     draft: SessionRecordDraft,
     app: tauri::AppHandle,
 ) -> Result<SessionRecord, String> {
-    let valid = validate(draft)?;
+    update_record_with(&app, &id, |_| Ok(draft))
+}
+
+/// Applies an edit built from the stored record, under the store lock, so a
+/// partial update (MCP) cannot race another writer between read and write.
+fn update_record_with(
+    app: &tauri::AppHandle,
+    id: &str,
+    build: impl FnOnce(&SessionRecord) -> Result<SessionRecordDraft, String>,
+) -> Result<SessionRecord, String> {
     let _guard = STORE_LOCK.lock().map_err(|error| error.to_string())?;
-    let path = records_path(&app)?;
+    let path = records_path(app)?;
     let mut records = read_records(&path)?;
     let record = records
         .iter_mut()
         .find(|record| record.id == id)
         .ok_or_else(|| "The note or task no longer exists.".to_owned())?;
+    let valid = validate(build(record)?)?;
     if record.kind != valid.kind {
         return Err("A note cannot be changed into a task.".to_owned());
     }
@@ -140,10 +158,71 @@ pub fn update_session_record(
     Ok(updated)
 }
 
+/// Records for the MCP bridge: one saved session's, or every record.
+pub(crate) fn mcp_list_records(
+    app: &tauri::AppHandle,
+    profile_id: Option<&str>,
+) -> Result<Vec<SessionRecord>, String> {
+    let _guard = STORE_LOCK.lock().map_err(|error| error.to_string())?;
+    let mut records: Vec<_> = read_records(&records_path(app)?)?
+        .into_iter()
+        .filter(|record| profile_id.map_or(true, |id| record.profile_id == id))
+        .collect();
+    records.sort_by_key(|record| (record.profile_id.clone(), record.created_at));
+    Ok(records)
+}
+
+pub(crate) fn mcp_create_record(
+    app: &tauri::AppHandle,
+    profile_id: String,
+    kind: String,
+    title: String,
+    content: Option<String>,
+    status: Option<String>,
+) -> Result<SessionRecord, String> {
+    // A task without an explicit status starts as todo; a note never has one.
+    let status = match (kind.as_str(), status) {
+        ("task", None) => Some("todo".to_owned()),
+        (_, status) => status,
+    };
+    create_record(
+        app,
+        profile_id,
+        SessionRecordDraft {
+            kind,
+            title,
+            content: content.unwrap_or_default(),
+            status,
+        },
+    )
+}
+
+/// Only the given fields change; kind is fixed once created.
+pub(crate) fn mcp_update_record(
+    app: &tauri::AppHandle,
+    id: &str,
+    title: Option<String>,
+    content: Option<String>,
+    status: Option<String>,
+) -> Result<SessionRecord, String> {
+    update_record_with(app, id, |record| {
+        Ok(SessionRecordDraft {
+            kind: record.kind.clone(),
+            title: title.unwrap_or_else(|| record.title.clone()),
+            content: content.unwrap_or_else(|| record.content.clone()),
+            status: status.or_else(|| record.status.clone()),
+        })
+    })
+}
+
 #[tauri::command]
 pub fn delete_session_record(id: String, app: tauri::AppHandle) -> Result<(), String> {
+    delete_record(&app, &id)
+}
+
+pub(crate) fn delete_record(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     let _guard = STORE_LOCK.lock().map_err(|error| error.to_string())?;
-    let path = records_path(&app)?;
+    let path = records_path(app)?;
     let mut records = read_records(&path)?;
     let previous_len = records.len();
     records.retain(|record| record.id != id);

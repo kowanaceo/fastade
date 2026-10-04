@@ -24,6 +24,29 @@ pub fn socket_path() -> Option<PathBuf> {
 enum Request {
     ListSessions,
     ListProjects,
+    /// Notes and tasks. `profile_id` wins; otherwise the caller's own
+    /// session (`$FASTADE_SESSION_ID`) picks the saved session they belong to.
+    ListRecords {
+        profile_id: Option<String>,
+        session_id: Option<String>,
+    },
+    CreateRecord {
+        profile_id: Option<String>,
+        session_id: Option<String>,
+        kind: String,
+        title: String,
+        content: Option<String>,
+        status: Option<String>,
+    },
+    UpdateRecord {
+        id: String,
+        title: Option<String>,
+        content: Option<String>,
+        status: Option<String>,
+    },
+    DeleteRecord {
+        id: String,
+    },
     /// Sent by an AI CLI's own hook (via `fastade_mcp report-activity`) when
     /// it has one — `session_id` comes from `$FASTADE_SESSION_ID`, which the
     /// hook's own shell inherited from fastade at spawn time.
@@ -103,6 +126,53 @@ fn handle_request(app: &tauri::AppHandle, request: Request) -> serde_json::Value
             Ok(projects) => serde_json::json!({ "ok": true, "projects": projects }),
             Err(error) => serde_json::json!({ "ok": false, "error": error }),
         },
+        Request::ListRecords {
+            profile_id,
+            session_id,
+        } => {
+            let profile = match resolve_profile(app, &state, profile_id, session_id, false) {
+                Ok(profile) => profile,
+                Err(error) => return serde_json::json!({ "ok": false, "error": error }),
+            };
+            match crate::records::mcp_list_records(app, profile.as_deref()) {
+                Ok(records) => serde_json::json!({ "ok": true, "records": records }),
+                Err(error) => serde_json::json!({ "ok": false, "error": error }),
+            }
+        }
+        Request::CreateRecord {
+            profile_id,
+            session_id,
+            kind,
+            title,
+            content,
+            status,
+        } => {
+            let result = resolve_profile(app, &state, profile_id, session_id, true)
+                .and_then(|profile| profile.ok_or_else(|| "A saved session is required.".to_owned()))
+                .and_then(|profile| {
+                    crate::records::mcp_create_record(app, profile, kind, title, content, status)
+                });
+            records_changed_response(app, result.map(|record| ("record", record)))
+        }
+        Request::UpdateRecord {
+            id,
+            title,
+            content,
+            status,
+        } => records_changed_response(
+            app,
+            crate::records::mcp_update_record(app, &id, title, content, status)
+                .map(|record| ("record", record)),
+        ),
+        Request::DeleteRecord { id } => {
+            match crate::records::delete_record(app, &id) {
+                Ok(()) => {
+                    let _ = app.emit("records-changed", ());
+                    serde_json::json!({ "ok": true })
+                }
+                Err(error) => serde_json::json!({ "ok": false, "error": error }),
+            }
+        }
         Request::ReportActivity {
             session_id,
             state: activity,
@@ -132,5 +202,58 @@ fn handle_request(app: &tauri::AppHandle, request: Request) -> serde_json::Value
             );
             serde_json::json!({ "ok": true })
         }
+    }
+}
+
+/// An explicit `profile_id` must name a saved session; otherwise the calling
+/// session's profile is used. `required` makes "no saved session" an error
+/// instead of "everything".
+#[cfg(unix)]
+fn resolve_profile(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, crate::session::AppState>,
+    profile_id: Option<String>,
+    session_id: Option<String>,
+    required: bool,
+) -> Result<Option<String>, String> {
+    if let Some(id) = profile_id.filter(|id| !id.trim().is_empty()) {
+        let known = crate::saved_sessions::list_saved_sessions(app.clone())?
+            .iter()
+            .any(|profile| profile.id == id);
+        return if known {
+            Ok(Some(id))
+        } else {
+            Err("Unknown profile_id. Use list_sessions to find a saved session's profileId.".to_owned())
+        };
+    }
+    if let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) {
+        if let Some(profile) = crate::session::mcp_profile_for_session(app, state, &session_id)? {
+            return Ok(Some(profile));
+        }
+    }
+    if required {
+        return Err(
+            "No saved session to attach to: pass profile_id (from list_sessions) or call this from a saved fastade session."
+                .to_owned(),
+        );
+    }
+    Ok(None)
+}
+
+/// Replies with the changed record and tells the window to re-read and sync,
+/// so an edit made through MCP reaches the server when signed in and simply
+/// stays local otherwise.
+#[cfg(unix)]
+fn records_changed_response(
+    app: &tauri::AppHandle,
+    result: Result<(&'static str, crate::records::SessionRecord), String>,
+) -> serde_json::Value {
+    use tauri::Emitter;
+    match result {
+        Ok((key, record)) => {
+            let _ = app.emit("records-changed", ());
+            serde_json::json!({ "ok": true, key: record })
+        }
+        Err(error) => serde_json::json!({ "ok": false, "error": error }),
     }
 }

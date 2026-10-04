@@ -170,6 +170,7 @@ export class AppViewModel {
   uploadingFiles = $state<Record<string, boolean>>({});
   private homeDirectory = '';
   private unsubscribeTerminal?: () => void;
+  private unsubscribeRecords?: () => void;
   private readonly terminalSinks = new Map<string, Set<TerminalSink>>();
   private readonly terminalWrites = new Map<string, Promise<void>>();
   private readonly hookInstalledSessionIds = new Set<string>();
@@ -331,6 +332,12 @@ export class AppViewModel {
       this.restoreWebAgents();
       this.restoreAgentDefaultModels();
       this.unsubscribeTerminal ??= await this.client.subscribeToTerminal((event) => this.handleTerminalEvent(event));
+      // An agent can add or edit notes and tasks through MCP: refresh the open
+      // list, and (main window only) push the change when signed in.
+      this.unsubscribeRecords ??= await this.client.subscribeToRecordChanges(() => {
+        this.recordsRevision += 1;
+        if (this.allowSyncLoop) this.requestSync();
+      });
       const [cliSessions, savedSessions, sshHosts, managedServers, homeDirectory, authStatus] = await Promise.all([
         this.client.listSessions(),
         this.client.listSavedSessions(),
@@ -384,6 +391,8 @@ export class AppViewModel {
     this.syncLoopGeneration += 1;
     this.unsubscribeTerminal?.();
     this.unsubscribeTerminal = undefined;
+    this.unsubscribeRecords?.();
+    this.unsubscribeRecords = undefined;
     this.terminalSinks.clear();
     this.terminalWrites.clear();
     this.contextWrites.clear();

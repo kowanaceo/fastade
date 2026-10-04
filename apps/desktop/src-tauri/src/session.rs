@@ -1046,6 +1046,19 @@ pub(crate) fn mcp_sessions(
     Ok(merge_mcp_sessions(profiles, sessions, &memory, &activity))
 }
 
+/// The saved session a running fastade session belongs to, so an MCP caller
+/// that only knows `$FASTADE_SESSION_ID` can still attach a note to it.
+pub(crate) fn mcp_profile_for_session(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    Ok(mcp_sessions(app, state)?
+        .into_iter()
+        .find(|session| session.session_id.as_deref() == Some(session_id))
+        .and_then(|session| session.profile_id))
+}
+
 fn merge_mcp_sessions(
     profiles: Vec<crate::saved_sessions::SavedSession>,
     mut sessions: Vec<SessionSummary>,
