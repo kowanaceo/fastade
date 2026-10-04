@@ -170,7 +170,7 @@ impl From<SessionStatus> for McpSessionStatus {
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CliKind {
     Codex,
@@ -602,7 +602,15 @@ fn spawn_terminal(
             },
             password,
         });
-    let (command, autofill_password) = build_command(session, managed_connection.as_ref())?;
+    let forward_socket = (session.endpoint != "local")
+        .then(crate::mcp::socket_path)
+        .flatten()
+        .filter(|path| path.exists());
+    let (command, autofill_password) =
+        build_command(session, managed_connection.as_ref(), forward_socket.as_deref())?;
+    if session.endpoint != "local" && forward_socket.is_some() {
+        crate::remote_mcp::ensure_installed_in_background(&app, &session.endpoint);
+    }
     let mut child = pair
         .slave
         .spawn_command(command)
@@ -720,6 +728,7 @@ struct ManagedConnection {
 fn build_command(
     session: &SessionSummary,
     managed: Option<&ManagedConnection>,
+    forward_socket: Option<&Path>,
 ) -> Result<(CommandBuilder, Option<String>), String> {
     if session.endpoint == "local" {
         let mut command = CommandBuilder::new(local_shell());
@@ -745,6 +754,19 @@ fn build_command(
         "-o",
         "TCPKeepAlive=yes",
     ]);
+    // Hand the remote shell this app's MCP socket, so an AI CLI running there
+    // can reach the same notes/tasks/activity as a local one without any
+    // credential ever being stored on the remote host.
+    let remote_socket = forward_socket.map(|local| {
+        let remote = crate::remote_mcp::remote_socket_path(&session.id);
+        command.args([
+            "-o",
+            "StreamLocalBindUnlink=yes",
+            "-R",
+            &format!("{remote}:{}", local.to_string_lossy()),
+        ]);
+        remote
+    });
     let password = if let Some(server) = managed {
         command.args(["-p", &server.port.to_string()]);
         if let Some(path) = &server.key_path {
@@ -756,11 +778,18 @@ fn build_command(
         command.arg(&session.endpoint);
         None
     };
-    if session.project_path != "~" {
+    let enter = (session.project_path != "~")
+        .then(|| format!("cd -- {} && ", shell_quote(&session.project_path)))
+        .unwrap_or_default();
+    if let Some(remote) = remote_socket {
+        // `env` rather than `export`, which not every login shell has.
         command.arg(format!(
-            "cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -l",
-            shell_quote(&session.project_path)
+            "{enter}exec env FASTADE_SESSION_ID={} FASTADE_SOCK={} \"${{SHELL:-/bin/sh}}\" -l",
+            shell_quote(&session.id),
+            shell_quote(&remote)
         ));
+    } else if session.project_path != "~" {
+        command.arg(format!("{enter}exec \"${{SHELL:-/bin/sh}}\" -l"));
     }
     Ok((command, password))
 }
@@ -1290,7 +1319,7 @@ mod tests {
     }
 
     fn managed_argv(session: &SessionSummary, managed: Option<&ManagedConnection>) -> Vec<String> {
-        build_command(session, managed)
+        build_command(session, managed, None)
             .unwrap()
             .0
             .get_argv()
@@ -1391,6 +1420,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_session_forwards_the_app_socket_and_exports_its_identity() {
+        let remote_session = session("kowanas.dev", "/root/my app");
+        let (command, _) =
+            build_command(&remote_session, None, Some(std::path::Path::new("/Users/u/Library/App Support/fastade.sock")))
+                .unwrap();
+        let argv: Vec<_> = command
+            .get_argv()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        let forward = argv.iter().position(|arg| arg == "-R").unwrap();
+        assert_eq!(
+            argv[forward + 1],
+            format!(
+                "/tmp/fastade-{}.sock:/Users/u/Library/App Support/fastade.sock",
+                remote_session.id
+            )
+        );
+        assert!(argv.contains(&"StreamLocalBindUnlink=yes".to_owned()));
+        let remote = argv.last().unwrap();
+        assert!(remote.starts_with("cd -- '/root/my app' && exec env FASTADE_SESSION_ID="));
+        assert!(remote.contains(&format!("FASTADE_SOCK='/tmp/fastade-{}.sock'", remote_session.id)));
+        assert!(remote.ends_with("\"${SHELL:-/bin/sh}\" -l"));
+
+        // Even a bare home session needs the environment to reach the bridge.
+        let (home, _) = build_command(&session("kowanas.dev", "~"), None, Some(std::path::Path::new("/s"))).unwrap();
+        assert!(home.get_argv().last().unwrap().to_string_lossy().starts_with("exec env FASTADE_SESSION_ID="));
+    }
+
+    #[test]
     fn managed_server_connects_with_port_and_key() {
         let connection = ManagedConnection {
             host: "1.2.3.4".to_owned(),
@@ -1400,7 +1459,7 @@ mod tests {
             password: None,
         };
         let (command, password) =
-            build_command(&session("managed:abc", "~"), Some(&connection)).unwrap();
+            build_command(&session("managed:abc", "~"), Some(&connection), None).unwrap();
         let argv: Vec<_> = command
             .get_argv()
             .iter()
@@ -1436,7 +1495,7 @@ mod tests {
             key_path: None,
             password: Some("hunter2".to_owned()),
         };
-        let (_, password) = build_command(&session("managed:abc", "~"), Some(&connection)).unwrap();
+        let (_, password) = build_command(&session("managed:abc", "~"), Some(&connection), None).unwrap();
         assert_eq!(password.as_deref(), Some("hunter2"));
     }
 

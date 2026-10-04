@@ -19,11 +19,80 @@ pub fn socket_path() -> Option<PathBuf> {
     Some(base.join("com.fastade.desktop").join("fastade.sock"))
 }
 
+/// The MCP tool list, defined once here so the local stdio bridge and the
+/// remote (Python) bridge, which asks the app for it, always agree.
+pub fn tool_definitions() -> serde_json::Value {
+    use serde_json::json;
+    json!([
+        {
+            "name": "list_sessions",
+            "description": "Return every saved fastade session, local or remote (SSH), overlaid with runtime session ID, current agent/model, per-agent last model metadata, status, hook-reported activity and memory usage when available. Saved entries that have not been opened are returned as disconnected.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "list_projects",
+            "description": "Return every project shown in fastade, one entry per saved project, with its name, current endpoint, project path, and paths remembered for other devices.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "list_records",
+            "description": "List notes (memos) and tasks attached to saved fastade sessions. Without profile_id it returns the records of the session this agent is running in, or every record when called outside a fastade session. Each record has id, profileId, kind (note|task), title, content and, for tasks, status (todo|in progress|done).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "profile_id": { "type": "string", "description": "A saved session's profileId from list_sessions." }
+                }
+            }
+        },
+        {
+            "name": "create_record",
+            "description": "Create a note (memo) or task on a saved fastade session. Defaults to the session this agent is running in; pass profile_id to target another. A task starts as todo unless a status is given.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["note", "task"] },
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "status": { "type": "string", "enum": ["todo", "in progress", "done"], "description": "Tasks only." },
+                    "profile_id": { "type": "string" }
+                },
+                "required": ["kind", "title"]
+            }
+        },
+        {
+            "name": "update_record",
+            "description": "Change a note's or task's title, content or (tasks only) status. Omitted fields are left as they are; the kind cannot change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "content": { "type": "string" },
+                    "status": { "type": "string", "enum": ["todo", "in progress", "done"] }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "delete_record",
+            "description": "Delete a note or task by id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        }
+    ])
+}
+
+
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {
     ListSessions,
     ListProjects,
+    /// The MCP tool list, for bridges that cannot embed it.
+    Tools,
     /// Notes and tasks. `profile_id` wins; otherwise the caller's own
     /// session (`$FASTADE_SESSION_ID`) picks the saved session they belong to.
     ListRecords {
@@ -126,6 +195,7 @@ fn handle_request(app: &tauri::AppHandle, request: Request) -> serde_json::Value
             Ok(projects) => serde_json::json!({ "ok": true, "projects": projects }),
             Err(error) => serde_json::json!({ "ok": false, "error": error }),
         },
+        Request::Tools => serde_json::json!({ "ok": true, "tools": tool_definitions() }),
         Request::ListRecords {
             profile_id,
             session_id,

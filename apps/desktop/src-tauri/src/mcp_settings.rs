@@ -30,6 +30,50 @@ pub fn mcp_binary_path() -> Result<PathBuf, String> {
     ))
 }
 
+/// Agents whose fastade MCP integration is switched on on this machine. A
+/// remote host is set up for exactly these.
+pub(crate) fn enabled_agents() -> Vec<CliKind> {
+    [CliKind::Claude, CliKind::Codex, CliKind::Gemini]
+        .into_iter()
+        .filter(|cli| mcp_agent_enabled(*cli).unwrap_or(false))
+        .collect()
+}
+
+fn mcp_agent_enabled(cli: CliKind) -> Result<bool, String> {
+    match cli {
+        CliKind::Claude => json_has_fastade(&claude_json_path()?),
+        CliKind::Gemini => json_has_fastade(&gemini_json_path()?),
+        CliKind::Codex => codex_has_fastade(),
+    }
+}
+
+/// The config files `configure_under` edits, relative to the home directory.
+pub(crate) fn config_files(cli: CliKind) -> &'static [&'static str] {
+    match cli {
+        CliKind::Claude => &[".claude.json", ".claude/settings.json"],
+        CliKind::Gemini => &[".gemini/settings.json"],
+        CliKind::Codex => &[".codex/config.toml", ".codex/hooks.json"],
+    }
+}
+
+/// Registers `binary` for one CLI under an arbitrary root laid out like a home
+/// directory. A remote host's files are fetched into such a root, edited with
+/// the very same code that edits the local ones, and sent back.
+pub(crate) fn configure_under(root: &Path, cli: CliKind, binary: &Path) -> Result<(), String> {
+    match cli {
+        CliKind::Claude => {
+            set_json_entry(&root.join(".claude.json"), true, binary)?;
+            set_claude_hooks_at(&root.join(".claude/settings.json"), true, binary)
+        }
+        CliKind::Gemini => set_json_entry(&root.join(".gemini/settings.json"), true, binary),
+        CliKind::Codex => {
+            set_codex_toml_at(&root.join(".codex/config.toml"), true, binary)?;
+            set_codex_hooks_at(&root.join(".codex/hooks.json"), true, binary)?;
+            set_codex_notify_at(&root.join(".codex/config.toml"), true, binary)
+        }
+    }
+}
+
 #[tauri::command]
 pub fn mcp_agent_status(cli: CliKind) -> Result<bool, String> {
     let enabled = match cli {

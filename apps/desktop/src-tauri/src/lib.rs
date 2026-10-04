@@ -4,6 +4,7 @@ mod mcp_settings;
 mod model_metadata;
 mod records;
 mod remote_fs;
+mod remote_mcp;
 mod saved_sessions;
 mod servers;
 mod session;
