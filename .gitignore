@@ -46,3 +46,6 @@ Thumbs.db
 
 # Tool-specific local settings
 .claude/settings.local.json
+
+# Local-only notes (never committed)
+*.local.md
