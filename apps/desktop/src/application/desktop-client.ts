@@ -1,4 +1,4 @@
-import type { AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput } from '../domain/session';
+import type { AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput } from '../domain/session';
 
 export interface CreateSessionInput {
   title: string;
@@ -44,6 +44,7 @@ export interface DesktopClient {
   getHomeDirectory(): Promise<string | null>;
   selectFolder(defaultPath?: string): Promise<string | null>;
   selectFile(defaultPath?: string): Promise<string | null>;
+  selectFiles(defaultPath?: string): Promise<string[]>;
   uploadFileToSession(sessionId: string, sourcePath: string): Promise<string>;
   subscribeToTerminal(handler: (event: TerminalEvent) => void): Promise<() => void>;
   createSession(input: CreateSessionInput): Promise<CliSessionSummary>;
@@ -52,6 +53,8 @@ export interface DesktopClient {
   terminalSnapshot(sessionId: string): Promise<string>;
   updateSessionContext(sessionId: string, title: string, projectPath: string): Promise<CliSessionSummary>;
   updateSessionAgent(sessionId: string, cli?: CliKind, model?: string): Promise<CliSessionSummary>;
+  refreshSessionAgentMetadata(sessionId: string): Promise<CliSessionSummary>;
+  listAgentModels(endpoint: string, cli: CliKind): Promise<AgentModelOption[]>;
   interruptSession(sessionId: string): Promise<CliSessionSummary>;
   reconnectSession(sessionId: string): Promise<CliSessionSummary>;
   closeSession(sessionId: string): Promise<void>;

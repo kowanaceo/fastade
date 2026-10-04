@@ -1,6 +1,9 @@
 import type { DesktopClient, SshHost, TerminalEvent } from '../application/desktop-client';
-import { type AgentUsage, type AuthUser, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type SyncEntity, type SyncPushChange, type UpdateServerInput, type WebAgent } from '../domain/session';
+import { syncSessionRecords } from '../application/session-record-sync';
+import type { SessionRecordRepository } from '../application/session-record-repository';
+import { type AgentModelOption, type AgentUsage, type AuthUser, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type SyncEntity, type SyncPushChange, type UpdateServerInput, type WebAgent } from '../domain/session';
 import { detectAgentActivity, type AgentActivity } from './activity-detector';
+import { detectAgentLaunch } from './agent-command';
 
 type TerminalSink = (data: string, replay?: boolean) => void;
 
@@ -31,7 +34,7 @@ export interface SessionGroupEntry {
  * `idle`: the agent is at its composer with no work in progress, or no agent
  * is running in this session's shell right now. */
 interface GroupDefinition { id: string; name: string; }
-interface ShellInputActions { launchedAgent: CliKind | null; }
+interface ShellInputActions { launch: { cli: CliKind; requestedModel?: string } | null; }
 interface SyncedRecord { version: number; hash: string; }
 interface SessionSyncState {
   cursor: number;
@@ -97,9 +100,14 @@ export class AppViewModel {
   googleLoginConfigured = $state(false);
   authBusy = $state(false);
   authError = $state<string | null>(null);
+  /** Why notes and tasks could not sync (null when they did or nobody is signed in). */
+  recordSyncError = $state<string | null>(null);
+  /** Bumped whenever a sync replaces the local notes, so open views reload. */
+  recordsRevision = $state(0);
   webAgents = $state<WebAgent[]>(DEFAULT_WEB_AGENTS.map((agent) => ({ ...agent })));
   agentUsage = $state<Record<string, AgentUsage>>({});
   agentDefaultModels = $state<Record<CliKind, string>>({ codex: '', claude: '', gemini: '' });
+  agentModels = $state<Record<CliKind, AgentModelOption[]>>({ codex: [], claude: [], gemini: [] });
   /** Whether that CLI's own MCP config currently registers fastade's
    * read-only session bridge — read from disk on load, kept in sync as the user
    * flips the Settings toggle. */
@@ -148,6 +156,7 @@ export class AppViewModel {
     this.syncLoopGeneration += 1;
     try {
       await this.client.googleSignOut();
+      this.recordSyncError = null;
       this.authUser = null;
       this.authDeviceId = null;
     } catch (error) {
@@ -169,11 +178,12 @@ export class AppViewModel {
   private readonly shellHomes = new Map<string, string>();
   private readonly shellInputBuffers = new Map<string, string>();
   private readonly contextWrites = new Map<string, Promise<void>>();
+  private readonly modelMetadataTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private usageTimer?: ReturnType<typeof setInterval>;
   private memoryTimer?: ReturnType<typeof setInterval>;
   private activityOverrideTimer?: ReturnType<typeof setInterval>;
 
-  constructor(readonly client: DesktopClient) {}
+  constructor(readonly client: DesktopClient, private readonly recordStore: SessionRecordRepository) {}
 
   get ungroupedProfiles(): SavedSessionProfile[] {
     // A saved profile is a reusable launch profile, not a one-session connection
@@ -231,11 +241,12 @@ export class AppViewModel {
     return (Object.keys(AGENT_COMMANDS) as CliKind[]).filter((cli) => enabledIds.has(cli));
   }
 
-  /** Model aliases each CLI documents in its own --help (not a live fetch —
-   * none of the three expose a scriptable "list models" command). Shown as
-   * datalist suggestions; any value can still be typed. */
+  /** Account-aware entries from each CLI's local model cache, with documented
+   * aliases as a fallback. The setting remains free-form for new model IDs. */
   knownModelAliases(cli: CliKind): string[] {
-    return cli === 'claude' ? ['fable', 'opus', 'sonnet'] : [];
+    const discovered = this.agentModels[cli].map((model) => model.id);
+    const aliases = cli === 'claude' ? ['fable', 'opus', 'sonnet'] : [];
+    return [...new Set([...aliases, ...discovered])];
   }
 
   /** A session sitting in the device's home has no project folder yet. */
@@ -329,6 +340,7 @@ export class AppViewModel {
         this.client.googleAuthStatus(),
       ]);
       this.sessions = cliSessions;
+      void this.refreshAgentModels('local');
       this.restoreRunningAgentState(cliSessions);
       this.savedSessions = savedSessions;
       this.sshHosts = sshHosts;
@@ -375,6 +387,8 @@ export class AppViewModel {
     this.terminalSinks.clear();
     this.terminalWrites.clear();
     this.contextWrites.clear();
+    this.modelMetadataTimers.forEach((timer) => clearTimeout(timer));
+    this.modelMetadataTimers.clear();
     if (this.usageTimer) clearInterval(this.usageTimer);
     this.usageTimer = undefined;
     if (this.memoryTimer) clearInterval(this.memoryTimer);
@@ -464,6 +478,21 @@ export class AppViewModel {
       }
     }));
     this.agentUsage = Object.fromEntries(entries);
+  }
+
+  async refreshAgentModels(endpoint = 'local', onlyCli?: CliKind): Promise<void> {
+    const clis = onlyCli ? [onlyCli] : Object.keys(AGENT_COMMANDS) as CliKind[];
+    const entries = await Promise.all(clis.map(async (cli) => {
+      try { return [cli, await this.client.listAgentModels(endpoint, cli)] as const; }
+      catch { return [cli, []] as const; }
+    }));
+    const next = { ...this.agentModels };
+    for (const [cli, models] of entries) {
+      const merged = new Map(next[cli].map((model) => [model.id, model]));
+      for (const model of models) merged.set(model.id, model);
+      next[cli] = [...merged.values()];
+    }
+    this.agentModels = next;
   }
 
   private static readonly LOCAL_CLI_KINDS: CliKind[] = ['codex', 'claude'];
@@ -785,17 +814,18 @@ export class AppViewModel {
     }
   }
 
-  /** Upload button: picks a file via the OS file dialog and drops it at the
-   * root of the session's project folder — copied locally, or uploaded over
-   * SSH for a remote session's endpoint. */
-  async uploadFile(sessionId: string): Promise<void> {
+  /** Upload button: picks one or more files via the OS file dialog and drops
+   * them at the root of the session's project folder — copied locally, or
+   * uploaded over SSH for a remote session's endpoint. Files are transferred
+   * sequentially so several SSH password helpers/connections do not compete. */
+  async uploadFiles(sessionId: string): Promise<void> {
     const session = this.sessions.find((item) => item.id === sessionId);
     if (!session) return;
     try {
-      const selected = await this.client.selectFile();
-      if (!selected) return;
+      const selected = await this.client.selectFiles();
+      if (!selected.length) return;
       this.uploadingFiles = { ...this.uploadingFiles, [sessionId]: true };
-      await this.client.uploadFileToSession(sessionId, selected);
+      for (const sourcePath of selected) await this.client.uploadFileToSession(sessionId, sourcePath);
     } catch (error) {
       this.error = this.message(error);
     } finally {
@@ -843,6 +873,8 @@ export class AppViewModel {
    * model from settings. The header then shows it until it exits. */
   async launchAgent(sessionId: string, cli: CliKind): Promise<void> {
     if (sessionId in this.runningAgents) return;
+    const session = this.sessions.find((item) => item.id === sessionId);
+    if (session?.endpoint && session.endpoint !== 'local') void this.refreshAgentModels(session.endpoint, cli);
     const model = this.agentDefaultModels[cli] || undefined;
     const command = model ? `${AGENT_COMMANDS[cli]} --model ${this.shellQuote(model)}` : AGENT_COMMANDS[cli];
     // Mark first so the typed-command detector in writeTerminal doesn't
@@ -953,8 +985,8 @@ export class AppViewModel {
     } finally {
       if (this.terminalWrites.get(sessionId) === write) this.terminalWrites.delete(sessionId);
     }
-    if (actions.launchedAgent && !(sessionId in this.runningAgents)) {
-      void this.markAgentRunning(sessionId, actions.launchedAgent);
+    if (actions.launch && !(sessionId in this.runningAgents)) {
+      void this.markAgentRunning(sessionId, actions.launch.cli, actions.launch.requestedModel);
     }
   }
 
@@ -1077,6 +1109,7 @@ export class AppViewModel {
   private handleTerminalEvent(event: TerminalEvent): void {
     if (event.kind === 'output') {
       this.terminalSinks.get(event.sessionId)?.forEach((sink) => sink(event.content));
+      if (event.sessionId in this.runningAgents) this.scheduleAgentMetadataRefresh(event.sessionId);
       return;
     }
     if (event.kind === 'activity') {
@@ -1092,6 +1125,9 @@ export class AppViewModel {
         const session = this.sessions.find((item) => item.id === event.sessionId);
         if (session?.cli) this.runningAgents = { ...this.runningAgents, [event.sessionId]: session.cli };
       }
+      // The same lifecycle hook also reports provider session/model metadata.
+      // Pull the persisted row after handling the immediate activity signal.
+      void this.refreshSessionSnapshot(event.sessionId);
       return;
     }
     const session = this.sessions.find((item) => item.id === event.sessionId);
@@ -1100,6 +1136,26 @@ export class AppViewModel {
     const status: CliSessionSummary['status'] = event.content === 'completed' ? 'completed' : 'failed';
     this.sessions = this.sessions.map((item) => item.id === event.sessionId ? { ...item, status } : item);
     this.clearAgentActivity(event.sessionId);
+  }
+
+  private async refreshSessionSnapshot(sessionId: string): Promise<void> {
+    try {
+      const updated = (await this.client.listSessions()).find((session) => session.id === sessionId);
+      if (updated) this.sessions = this.sessions.map((session) => session.id === sessionId ? updated : session);
+    } catch {
+      // Metadata enrichment is best-effort and must never disturb the terminal.
+    }
+  }
+
+  private scheduleAgentMetadataRefresh(sessionId: string): void {
+    const existing = this.modelMetadataTimers.get(sessionId);
+    if (existing) clearTimeout(existing);
+    this.modelMetadataTimers.set(sessionId, setTimeout(() => {
+      this.modelMetadataTimers.delete(sessionId);
+      void this.client.refreshSessionAgentMetadata(sessionId).then((updated) => {
+        this.sessions = this.sessions.map((session) => session.id === sessionId ? updated : session);
+      }).catch(() => undefined);
+    }, 1_500));
   }
 
   /** Hookless sessions (notably remote SSH) are classified from the current
@@ -1300,8 +1356,27 @@ export class AppViewModel {
     this.savedSessions = profiles;
     this.pruneProfileLinks(new Set(profiles.map((profile) => profile.id)));
     this.writeSessionSyncState(user.id, snapshot.cursor, finalRemote.profiles, finalRemote.devicePaths);
+    await this.syncNotesAndTasks(user.id, mayMigrateLocal, owner !== null && owner !== user.id);
     localStorage.setItem(SESSION_SYNC_OWNER_KEY, user.id);
     this.authError = null;
+  }
+
+  /** Notes and tasks sync on their own: a server that cannot take them yet
+   * must not stop session profiles from syncing. */
+  private async syncNotesAndTasks(userId: string, mayMigrateLocal: boolean, backupLocal: boolean): Promise<void> {
+    try {
+      const outcome = await syncSessionRecords(this.client, this.recordStore, { userId, mayMigrateLocal, backupLocal });
+      this.recordSyncError = null;
+      this.recordsRevision += 1;
+      if (outcome.again) this.sessionSyncPending = true;
+    } catch (error) {
+      this.recordSyncError = this.message(error);
+    }
+  }
+
+  /** Called after a note or task is saved locally so the change is pushed. */
+  requestSync(): void {
+    void this.syncSessionInformation();
   }
 
   private async localSessionEntities(deviceId: string): Promise<{
@@ -1508,14 +1583,13 @@ export class AppViewModel {
   }
 
   private trackShellInput(sessionId: string, data: string): ShellInputActions {
-    const actions: ShellInputActions = { launchedAgent: null };
+    const actions: ShellInputActions = { launch: null };
     if (data === SHELL_CWD_HOOK || sessionId in this.runningAgents) return actions;
     let buffer = this.shellInputBuffers.get(sessionId) ?? '';
     for (const character of data) {
       if (character === '\r' || character === '\n') {
         const command = this.cleanShellCommand(buffer);
-        const launched = command.match(/^(?:command\s+)?(codex|claude|gemini)(?:\s|$)/);
-        if (launched) actions.launchedAgent = launched[1] as CliKind;
+        actions.launch = detectAgentLaunch(command);
         buffer = '';
       } else if (character === '\x7f' || character === '\b') {
         buffer = Array.from(buffer).slice(0, -1).join('');
@@ -1535,13 +1609,16 @@ export class AppViewModel {
     this.setAgentActivity(sessionId, 'working');
     try {
       const updated = await this.client.updateSessionAgent(sessionId, cli, model);
-      this.sessions = this.sessions.map((item) => item.id === sessionId ? { ...item, cli: updated.cli, model: updated.model } : item);
+      this.sessions = this.sessions.map((item) => item.id === sessionId ? updated : item);
     } catch (error) {
       this.error = this.message(error);
     }
   }
 
   private markAgentExited(sessionId: string): void {
+    const metadataTimer = this.modelMetadataTimers.get(sessionId);
+    if (metadataTimer) clearTimeout(metadataTimer);
+    this.modelMetadataTimers.delete(sessionId);
     const next = { ...this.runningAgents };
     delete next[sessionId];
     this.runningAgents = next;
@@ -1549,8 +1626,10 @@ export class AppViewModel {
     // A hook's last-reported value would otherwise sit in the backend store
     // forever and later look like fresh evidence that the agent is running.
     this.clearActivityOverride(sessionId);
-    void this.client.updateSessionAgent(sessionId).then((updated) => {
-      this.sessions = this.sessions.map((item) => item.id === sessionId ? { ...item, cli: updated.cli, model: updated.model } : item);
+    // Give hookless CLIs one final transcript read before clearing the current
+    // agent; updateSessionAgent then moves the enriched value into lastModels.
+    void this.client.refreshSessionAgentMetadata(sessionId).catch(() => undefined).then(() => this.client.updateSessionAgent(sessionId)).then((updated) => {
+      this.sessions = this.sessions.map((item) => item.id === sessionId ? updated : item);
     }).catch(() => undefined);
   }
 

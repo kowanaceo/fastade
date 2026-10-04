@@ -4,11 +4,20 @@
   import { createDesktopClient } from '../application/client-provider';
   import { type CliKind, type WebAgent } from '../domain/session';
   import { AppViewModel } from '../viewmodel/app-view-model.svelte';
+  import { TauriSessionRecordRepository } from '../infrastructure/tauri-session-record-repository';
   import RemoteFolderPicker from './RemoteFolderPicker.svelte';
   import ServerPicker from './ServerPicker.svelte';
+  import SessionRecords from './SessionRecords.svelte';
   import TerminalPane from './TerminalPane.svelte';
 
-  const viewModel = new AppViewModel(createDesktopClient());
+  const recordRepository = new TauriSessionRecordRepository();
+  const viewModel = new AppViewModel(createDesktopClient(), recordRepository);
+  const recordSyncNote = $derived(
+    !viewModel.authenticated ? 'Stored on this device only. Sign in to back up and sync.'
+      : viewModel.recordSyncError ? `Not synced: ${viewModel.recordSyncError}`
+      : 'Synced with your account.',
+  );
+  let recordsTarget = $state<{ profileId: string; name: string } | null>(null);
   const poppedSessionId = new URLSearchParams(window.location.search).get('session');
   const cliNames: Record<CliKind, string> = { codex: 'Codex', gemini: 'Gemini', claude: 'Claude Code' };
   const activityLabels: Record<'working' | 'waiting' | 'idle', string> = {
@@ -114,6 +123,10 @@
     }
     if (sessionMenu || groupMenu) {
       closeContextMenus();
+      return;
+    }
+    if (recordsTarget) {
+      recordsTarget = null;
       return;
     }
     if (viewModel.settingsOpen) {
@@ -450,6 +463,7 @@
           {@const agentRunning = viewModel.isAgentRunning(session.id)}
           {@const activity = viewModel.activityFor(session.id)}
           {@const memoryLabel = viewModel.memoryLabelFor(session.id)}
+          {@const recordProfile = viewModel.profileForSession(session)}
           <article data-session-id={session.id} hidden={!poppedSessionId && !visibleSessions.some((visible) => visible.id === session.id)} role="group" aria-label={`${session.title} terminal session`} class:active={session.id === viewModel.selectedSessionId} class:grid-left={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id === session.id} class:grid-right={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id !== session.id && visibleSessions.some((visible) => visible.id === session.id)} class="session-card" oncontextmenu={(event) => openSessionMenu(event, session.id)}>
             <header class="card-header">
               <div class="session-identity"><span class="cli-badge">{session.cli ? session.cli.slice(0, 1).toUpperCase() : '$'}</span><strong title={session.title}>{session.title}</strong><span class="agent">{session.cli ? `${cliNames[session.cli]}${session.model ? ` · ${session.model}` : ''}` : 'shell'}</span>
@@ -457,7 +471,8 @@
                 {#if memoryLabel}<span class="memory-chip" title="Resident memory used by this session's shell and its child processes">{memoryLabel}</span>{/if}
                 <span title={session.endpoint}>⌁ {viewModel.endpointLabel(session.endpoint)}</span>
                 <button class="folder folder-confirm" disabled={agentRunning} title={agentRunning ? 'Stop the running agent (■) before changing folders' : `${session.projectPath} — click to change folder (also renames the session)`} onclick={(event) => { event.stopPropagation(); void viewModel.changeFolder(session.id); }}>⌂ {session.projectPath}</button>
-                <button class="upload" disabled={viewModel.uploadingFiles[session.id]} title={session.endpoint === 'local' ? 'Upload a file — copies it into this session’s folder' : 'Upload a file — sends it into this session’s folder over SSH'} onclick={(event) => { event.stopPropagation(); void viewModel.uploadFile(session.id); }}>{viewModel.uploadingFiles[session.id] ? '⇪…' : '⇪'}</button>
+                <button class="upload" disabled={!recordProfile} title={recordProfile ? 'Notes and tasks for this project (stored on this device)' : 'Keep this session in Ungrouped (+) to attach notes and tasks'} aria-label={`Notes and tasks for ${session.title}`} onclick={(event) => { event.stopPropagation(); if (recordProfile) recordsTarget = { profileId: recordProfile.id, name: recordProfile.name }; }}>✎</button>
+                <button class="upload" disabled={viewModel.uploadingFiles[session.id]} title={session.endpoint === 'local' ? 'Upload files — copies them into this session’s folder' : 'Upload files — sends them into this session’s folder over SSH'} onclick={(event) => { event.stopPropagation(); void viewModel.uploadFiles(session.id); }}>{viewModel.uploadingFiles[session.id] ? '⇪…' : '⇪'}</button>
                 <span class="state" data-status={session.status}>{session.status}</span>
                 {#if !agentRunning && session.status === 'running'}
                   <select class="agent-picker" aria-label="Run AI agent" value="" onclick={(event) => event.stopPropagation()} onchange={(event) => { const picked = event.currentTarget.value as CliKind | ''; event.currentTarget.value = ''; if (picked) void viewModel.launchAgent(session.id, picked); }}>
@@ -511,6 +526,16 @@
     ondragleave={() => { trashHover = false; }}
     ondrop={handleTrashDrop}
   >🗑 Drop here to delete</div>
+{/if}
+
+{#if recordsTarget}
+  <div class="settings-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) recordsTarget = null; }}>
+    <div class="records-dialog" role="dialog" aria-modal="true" aria-label="Notes and tasks">
+      {#key recordsTarget.profileId}
+        <SessionRecords profileId={recordsTarget.profileId} sessionName={recordsTarget.name} repository={recordRepository} revision={viewModel.recordsRevision} syncNote={recordSyncNote} onChanged={() => viewModel.requestSync()} onClose={() => { recordsTarget = null; }} />
+      {/key}
+    </div>
+  </div>
 {/if}
 
 {#if sessionMenu}
@@ -568,21 +593,19 @@
             <span class="agent-color" style={`background:${agent.accent}`}></span><span><strong>{agent.name}</strong><small>{agent.chatUrl}</small></span>
             {#if agent.builtIn && agent.id in cliNames}
               {@const cli = agent.id as CliKind}
-              {#if viewModel.knownModelAliases(cli).length}
-                <label class="agent-model-inline" title="Applied as --model when this CLI runs in a session.">
-                  <select value={viewModel.agentDefaultModels[cli]} onchange={(event) => viewModel.setAgentDefaultModel(cli, event.currentTarget.value)}>
-                    <option value="">CLI default</option>
-                    {#each viewModel.knownModelAliases(cli) as alias}<option value={alias}>{alias}</option>{/each}
-                  </select>
-                </label>
-              {/if}
+              <label class="agent-model-inline" title="Applied as --model when this CLI runs in a session. Type any model ID or choose one discovered from the CLI cache.">
+                <input list={`agent-models-${cli}`} value={viewModel.agentDefaultModels[cli]} placeholder="CLI default" onchange={(event) => viewModel.setAgentDefaultModel(cli, event.currentTarget.value)} />
+                <datalist id={`agent-models-${cli}`}>
+                  {#each viewModel.knownModelAliases(cli) as alias}<option value={alias}></option>{/each}
+                </datalist>
+              </label>
               <button
                 type="button"
                 class="mcp-toggle"
                 class:active={viewModel.mcpAgentEnabled[cli]}
                 role="switch"
                 aria-checked={viewModel.mcpAgentEnabled[cli]}
-                title="Registers fastade's read-only session status tool (list_sessions) in this CLI's own MCP config."
+                title="Registers fastade's read-only session status tool and lifecycle hooks for activity and effective-model metadata."
                 onclick={() => void viewModel.setMcpAgentEnabled(cli, !viewModel.mcpAgentEnabled[cli])}
               >
                 <span class="toggle-track"><span class="toggle-thumb"></span></span>

@@ -26,7 +26,7 @@ Matched top to bottom, most specific first — pressing Esc while renaming a gro
 
 **Session groups** — Create new groups in the sidebar and drag-and-drop sessions to organize them by project. Deleting a group moves its sessions back to the default group.
 
-**Running AI agents** — Pick Codex/Claude Code/Gemini from the session header's agent picker to run it inside that shell (using the per-CLI default model set in Settings). Pressing ■ exits the agent and returns to the shell.
+**Running AI agents** — Pick Codex/Claude Code/Gemini from the session header's agent picker to run it inside that shell (using the per-CLI default model set in Settings). Model suggestions are discovered from each CLI's local cache, while the field still accepts any model ID. Pressing ■ exits the agent and returns to the shell. fastade retains the last model used by each CLI; when lifecycle integration is enabled, it also records the provider session ID and effective model reported by the CLI transcript.
 
 **Activity status badges** — A colored dot on each session card shows Working / Needs you (waiting on approval or input) / Ready at a glance. Codex and Claude Code report status through their own CLI hooks for higher accuracy; Gemini and remote SSH sessions are inferred from terminal output patterns.
 

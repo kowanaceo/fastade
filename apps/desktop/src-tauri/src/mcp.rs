@@ -30,6 +30,8 @@ enum Request {
     ReportActivity {
         session_id: String,
         state: String,
+        provider_session_id: Option<String>,
+        effective_model: Option<String>,
     },
 }
 
@@ -104,11 +106,19 @@ fn handle_request(app: &tauri::AppHandle, request: Request) -> serde_json::Value
         Request::ReportActivity {
             session_id,
             state: activity,
+            provider_session_id,
+            effective_model,
         } => {
             if !matches!(activity.as_str(), "working" | "waiting" | "idle") {
                 return serde_json::json!({ "ok": false, "error": "invalid activity state" });
             }
             crate::session::set_activity_override(&session_id, &activity, &state);
+            let _ = crate::session::set_agent_metadata(
+                &session_id,
+                provider_session_id,
+                effective_model,
+                &state,
+            );
             // Keep the persisted snapshot for reloads, but also push the
             // transition to the visible window immediately. Polling alone made
             // a short turn look stuck in its previous colour for up to a second.

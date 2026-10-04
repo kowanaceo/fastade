@@ -73,6 +73,40 @@ fn apply_target(command: &mut Command, target: &SshTarget) -> Option<String> {
     }
 }
 
+/// Runs a bounded, non-interactive read-only helper on an SSH endpoint.
+/// Kept here so metadata discovery uses the exact same host resolution and
+/// password handling as the remote folder browser.
+pub(crate) fn run_remote_script(
+    endpoint: &str,
+    script: &str,
+    app: &tauri::AppHandle,
+) -> Result<String, String> {
+    let target = resolve_target(endpoint, app)?;
+    let mut command = Command::new("ssh");
+    command.arg("-o").arg("ConnectTimeout=8");
+    let password = apply_target(&mut command, &target);
+    let askpass = password.as_deref().map(AskpassHelper::write).transpose()?;
+    if let Some(helper) = &askpass {
+        command.env("SSH_ASKPASS", helper.script_path());
+        command.env("SSH_ASKPASS_REQUIRE", "force");
+        command.env_remove("DISPLAY");
+    }
+    let output = command
+        .args(["--", script])
+        .output()
+        .map_err(|error| format!("SSH connection failed: {error}"))?;
+    drop(askpass);
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if message.is_empty() {
+            "Remote metadata lookup failed.".to_owned()
+        } else {
+            message
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Streams a local file into `remote_path` on a remote SSH device, creating
 /// its parent directory first. Uses the same non-interactive `ssh` +
 /// `SSH_ASKPASS` approach as [`list_remote_directory`] — a one-off exec, not

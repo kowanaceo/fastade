@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { CreateSessionInput, DesktopClient, RemoteDirectoryListing, SaveSessionInput, SshHost, TerminalEvent } from '../application/desktop-client';
-import type { AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput } from '../domain/session';
+import type { AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput } from '../domain/session';
 
 export class TauriDesktopClient implements DesktopClient {
   listSessions(): Promise<CliSessionSummary[]> {
@@ -71,6 +71,12 @@ export class TauriDesktopClient implements DesktopClient {
     return typeof selected === 'string' ? selected : null;
   }
 
+  async selectFiles(defaultPath?: string): Promise<string[]> {
+    const selected = await open({ directory: false, multiple: true, defaultPath });
+    if (Array.isArray(selected)) return selected;
+    return typeof selected === 'string' ? [selected] : [];
+  }
+
   uploadFileToSession(sessionId: string, sourcePath: string): Promise<string> {
     return invoke<string>('upload_file_to_session', { sessionId, sourcePath });
   }
@@ -101,6 +107,14 @@ export class TauriDesktopClient implements DesktopClient {
 
   updateSessionAgent(sessionId: string, cli?: CliKind, model?: string): Promise<CliSessionSummary> {
     return invoke<CliSessionSummary>('update_session_agent', { sessionId, cli: cli ?? null, model: model ?? null });
+  }
+
+  refreshSessionAgentMetadata(sessionId: string): Promise<CliSessionSummary> {
+    return invoke<CliSessionSummary>('refresh_session_agent_metadata', { sessionId });
+  }
+
+  listAgentModels(endpoint: string, cli: CliKind): Promise<AgentModelOption[]> {
+    return invoke<AgentModelOption[]>('list_agent_models', { endpoint, cli });
   }
 
   interruptSession(sessionId: string): Promise<CliSessionSummary> {

@@ -13,7 +13,8 @@ fn main() {
         // status update, then exit immediately so the hook never blocks the
         // CLI it's attached to.
         let state = args.get(2).map(String::as_str).unwrap_or("idle");
-        report_activity(hook_state(state));
+        let payload = read_hook_payload(args.get(3).map(String::as_str));
+        report_activity(hook_state(state, payload.as_deref()), payload.as_deref());
         // Codex Stop/Interrupt hooks require successful command hooks to
         // return a JSON object. An empty object is also harmless for Claude
         // hooks and for Codex's legacy `notify` callback.
@@ -65,7 +66,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "list_sessions",
-            "description": "Return every saved fastade session, local or remote (SSH), overlaid with runtime session ID, agent, model, status, hook-reported activity and memory usage when available. Saved entries that have not been opened are returned as disconnected.",
+            "description": "Return every saved fastade session, local or remote (SSH), overlaid with runtime session ID, current agent/model, per-agent last model metadata, status, hook-reported activity and memory usage when available. Saved entries that have not been opened are returned as disconnected.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -99,24 +100,34 @@ fn call_tool(params: Value) -> Result<Value, Value> {
 /// The hook payload on stdin names the tool, so promote that one to
 /// `waiting`. stdin is only read for `working` hooks and never from a
 /// terminal, so a manual run or Codex's `notify` callback cannot block here.
-fn hook_state(state: &str) -> &str {
-    use std::io::{IsTerminal, Read};
-
-    if state != "working" || io::stdin().is_terminal() {
+fn hook_state<'a>(state: &'a str, payload: Option<&str>) -> &'a str {
+    if state != "working" {
         return state;
     }
-    let mut payload = String::new();
-    if io::stdin().take(1 << 20).read_to_string(&mut payload).is_err() {
-        return state;
-    }
-    let tool = serde_json::from_str::<Value>(&payload)
-        .ok()
+    let tool = payload
+        .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
         .and_then(|value| value.get("tool_name")?.as_str().map(str::to_owned));
     if is_user_question_tool(tool.as_deref()) {
         "waiting"
     } else {
         state
     }
+}
+
+fn read_hook_payload(argument: Option<&str>) -> Option<String> {
+    use std::io::{IsTerminal, Read};
+    if let Some(argument) = argument.filter(|value| value.trim_start().starts_with('{')) {
+        return Some(argument.to_owned());
+    }
+    if io::stdin().is_terminal() {
+        return None;
+    }
+    let mut payload = String::new();
+    io::stdin()
+        .take(1 << 20)
+        .read_to_string(&mut payload)
+        .ok()?;
+    (!payload.trim().is_empty()).then_some(payload)
 }
 
 fn is_user_question_tool(tool: Option<&str>) -> bool {
@@ -126,12 +137,64 @@ fn is_user_question_tool(tool: Option<&str>) -> bool {
 /// Silently does nothing if `$FASTADE_SESSION_ID` is unset (not run inside a
 /// fastade session) or the app is not running — a hook must never fail the
 /// CLI turn it is attached to just because the status update didn't land.
-fn report_activity(state: &str) {
+fn report_activity(state: &str, payload: Option<&str>) {
     let Ok(session_id) = std::env::var("FASTADE_SESSION_ID") else {
         return;
     };
-    let request = json!({ "op": "report_activity", "session_id": session_id, "state": state });
+    let hook = payload.and_then(|payload| serde_json::from_str::<Value>(payload).ok());
+    let provider_session_id = hook.as_ref().and_then(|value| {
+        value
+            .get("session_id")
+            .or_else(|| value.get("sessionId"))
+            .and_then(Value::as_str)
+    });
+    let transcript_path = hook.as_ref().and_then(|value| {
+        value
+            .get("transcript_path")
+            .or_else(|| value.get("transcriptPath"))
+            .and_then(Value::as_str)
+    });
+    let effective_model = transcript_path.and_then(read_effective_model).or_else(|| {
+        hook.as_ref().and_then(|value| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    });
+    let request = json!({
+        "op": "report_activity",
+        "session_id": session_id,
+        "state": state,
+        "provider_session_id": provider_session_id,
+        "effective_model": effective_model,
+    });
     let _ = send_to_app(&request);
+}
+
+fn read_effective_model(path: &str) -> Option<String> {
+    use std::{
+        fs::File,
+        io::{Read, Seek, SeekFrom},
+    };
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(1024 * 1024);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    contents
+        .lines()
+        .filter_map(|line| {
+            let value = serde_json::from_str::<Value>(line).ok()?;
+            value
+                .pointer("/payload/model")
+                .or_else(|| value.pointer("/message/model"))
+                .or_else(|| value.get("model"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .last()
 }
 
 #[cfg(unix)]
@@ -164,6 +227,7 @@ fn send_to_app(_request: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn exposes_only_read_only_listing_tools() {
@@ -176,5 +240,23 @@ mod tests {
         let error = call_tool(json!({ "name": "send_message", "arguments": {} }))
             .expect_err("removed mutation tools must stay unavailable");
         assert_eq!(error["code"], -32602);
+    }
+
+    #[test]
+    fn reads_effective_models_from_codex_and_claude_transcripts() {
+        let path = std::env::temp_dir().join(format!("fastade-model-{}.jsonl", std::process::id()));
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-old\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-new\"}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_effective_model(path.to_str().unwrap()).as_deref(),
+            Some("claude-new")
+        );
+        fs::remove_file(path).unwrap();
     }
 }

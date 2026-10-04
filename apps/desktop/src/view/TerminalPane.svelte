@@ -173,6 +173,23 @@
       onInterrupt(sessionId);
       return false;
     });
+    // Option+drag is how macOS users select text while a full-screen app has
+    // mouse reporting on; copy that selection as soon as the button is
+    // released so no extra Cmd+C is needed. Plain drags keep the usual flow.
+    let optionSelecting = false;
+    const handleOptionMouseDown = (event: MouseEvent): void => {
+      optionSelecting = event.altKey && event.button === 0;
+    };
+    const handleOptionMouseUp = (): void => {
+      if (!optionSelecting) return;
+      optionSelecting = false;
+      // xterm finalizes the selection after mouseup has been dispatched.
+      setTimeout(() => {
+        if (terminal.hasSelection()) void navigator.clipboard.writeText(terminal.getSelection()).catch(() => {});
+      }, 0);
+    };
+    terminal.element?.addEventListener('mousedown', handleOptionMouseDown, { capture: true });
+    window.addEventListener('mouseup', handleOptionMouseUp, { capture: true });
     let fitFrame = 0;
     let fitTimers: Array<ReturnType<typeof setTimeout>> = [];
     const fitAndRefresh = (): void => {
@@ -239,6 +256,8 @@
       removeHangulImeAdapter();
       unregister();
       input.dispose();
+      terminal.element?.removeEventListener('mousedown', handleOptionMouseDown, { capture: true });
+      window.removeEventListener('mouseup', handleOptionMouseUp, { capture: true });
       terminal.element?.removeEventListener('paste', handlePaste, { capture: true });
       cwd.dispose();
       resized.dispose();

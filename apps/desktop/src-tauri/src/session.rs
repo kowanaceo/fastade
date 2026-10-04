@@ -97,9 +97,36 @@ pub struct SessionSummary {
     pub title: String,
     pub cli: Option<CliKind>,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_agent: Option<AgentModelInfo>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub last_models: HashMap<String, AgentModelInfo>,
     pub endpoint: String,
     pub project_path: String,
     pub status: SessionStatus,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelInfo {
+    pub cli: CliKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    pub detected_at: String,
+    pub source: AgentModelSource,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentModelSource {
+    LaunchArg,
+    SessionLog,
+    Config,
+    Unknown,
 }
 
 /// Read-only session snapshot exposed by fastade MCP. Terminal transcripts
@@ -114,6 +141,8 @@ pub(crate) struct McpSessionSummary {
     title: String,
     cli: Option<CliKind>,
     model: Option<String>,
+    current_agent: Option<AgentModelInfo>,
+    last_models: HashMap<String, AgentModelInfo>,
     endpoint: String,
     project_path: String,
     status: McpSessionStatus,
@@ -141,7 +170,7 @@ impl From<SessionStatus> for McpSessionStatus {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CliKind {
     Codex,
@@ -208,6 +237,8 @@ pub fn create_session(
         title: input.title,
         cli: None,
         model: None,
+        current_agent: None,
+        last_models: HashMap::new(),
         endpoint: input.endpoint,
         project_path: input.project_path,
         status: SessionStatus::Running,
@@ -350,12 +381,96 @@ pub fn update_session_agent(
             .iter_mut()
             .find(|session| session.id == session_id)
             .ok_or_else(|| "session not found".to_owned())?;
-        session.cli = cli;
-        session.model = model.filter(|value| !value.trim().is_empty());
+        apply_session_agent(session, cli, model);
         session.clone()
     };
     persist_sessions(&state)?;
     Ok(updated)
+}
+
+fn apply_session_agent(session: &mut SessionSummary, cli: Option<CliKind>, model: Option<String>) {
+    let requested_model = model.filter(|value| !value.trim().is_empty());
+    if let Some(cli) = cli {
+        let info = AgentModelInfo {
+            cli,
+            requested_model: requested_model.clone(),
+            effective_model: None,
+            provider_session_id: None,
+            detected_at: chrono::Utc::now().to_rfc3339(),
+            source: if requested_model.is_some() {
+                AgentModelSource::LaunchArg
+            } else {
+                AgentModelSource::Unknown
+            },
+        };
+        session
+            .last_models
+            .insert(cli_key(cli).to_owned(), info.clone());
+        session.current_agent = Some(info);
+        session.cli = Some(cli);
+        session.model = requested_model;
+    } else {
+        if let Some(info) = session.current_agent.take() {
+            session
+                .last_models
+                .insert(cli_key(info.cli).to_owned(), info);
+        }
+        session.cli = None;
+        session.model = None;
+    }
+}
+
+fn cli_key(cli: CliKind) -> &'static str {
+    match cli {
+        CliKind::Codex => "codex",
+        CliKind::Claude => "claude",
+        CliKind::Gemini => "gemini",
+    }
+}
+
+/// Applies metadata reported by the running CLI's lifecycle hook. The
+/// FASTADE_SESSION_ID inherited from the PTY makes this association exact,
+/// unlike guessing from cwd when several agents use the same project.
+pub(crate) fn set_agent_metadata(
+    session_id: &str,
+    provider_session_id: Option<String>,
+    effective_model: Option<String>,
+    state: &AppState,
+) -> Result<(), String> {
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "session store is unavailable".to_owned())?;
+    let session = sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "session not found".to_owned())?;
+    apply_agent_metadata(session, provider_session_id, effective_model);
+    drop(sessions);
+    persist_sessions(state)
+}
+
+fn apply_agent_metadata(
+    session: &mut SessionSummary,
+    provider_session_id: Option<String>,
+    effective_model: Option<String>,
+) {
+    let Some(mut info) = session.current_agent.clone() else {
+        return;
+    };
+    if let Some(value) = provider_session_id.filter(|value| !value.trim().is_empty()) {
+        info.provider_session_id = Some(value);
+    }
+    if let Some(value) = effective_model.filter(|value| !value.trim().is_empty()) {
+        info.effective_model = Some(value.clone());
+        session.model = Some(value);
+        info.source = AgentModelSource::SessionLog;
+    }
+    info.detected_at = chrono::Utc::now().to_rfc3339();
+    session
+        .last_models
+        .insert(cli_key(info.cli).to_owned(), info.clone());
+    session.current_agent = Some(info);
 }
 
 #[tauri::command]
@@ -689,7 +804,7 @@ fn get_terminal(
         .ok_or_else(|| "terminal is not running".to_owned())
 }
 
-fn find_session(
+pub(crate) fn find_session(
     session_id: &str,
     state: &tauri::State<'_, AppState>,
 ) -> Result<SessionSummary, String> {
@@ -965,6 +1080,8 @@ fn merge_mcp_sessions(
                 title: profile.name,
                 cli: None,
                 model: None,
+                current_agent: None,
+                last_models: HashMap::new(),
                 endpoint: profile.last_endpoint,
                 project_path,
                 status: McpSessionStatus::Disconnected,
@@ -1004,6 +1121,8 @@ fn mcp_summary(
         title: session.title,
         cli: session.cli,
         model: session.model,
+        current_agent: session.current_agent,
+        last_models: session.last_models,
         endpoint: session.endpoint,
         project_path: session.project_path,
         status: session.status.into(),
@@ -1132,8 +1251,9 @@ pub(crate) fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_command, merge_mcp_sessions, resolve_program, shell_quote, ManagedConnection,
-        SessionStatus, SessionSummary, Utf8StreamDecoder,
+        apply_agent_metadata, apply_session_agent, build_command, merge_mcp_sessions,
+        resolve_program, shell_quote, AgentModelSource, ManagedConnection, SessionStatus,
+        SessionSummary, Utf8StreamDecoder,
     };
     use crate::saved_sessions::SavedSession;
     use std::collections::HashMap;
@@ -1144,6 +1264,8 @@ mod tests {
             title: "test".to_owned(),
             cli: None,
             model: None,
+            current_agent: None,
+            last_models: HashMap::new(),
             endpoint: endpoint.to_owned(),
             project_path: project_path.to_owned(),
             status: SessionStatus::Running,
@@ -1190,6 +1312,8 @@ mod tests {
             title: "active project".to_owned(),
             cli: None,
             model: None,
+            current_agent: None,
+            last_models: HashMap::new(),
             endpoint: "local".to_owned(),
             project_path: "/active".to_owned(),
             status: SessionStatus::Running,
@@ -1320,5 +1444,52 @@ mod tests {
         }
         decoded.push_str(&decoder.finish());
         assert_eq!(decoded, "한글 출력");
+    }
+
+    #[test]
+    fn legacy_sessions_deserialize_without_model_metadata() {
+        let legacy = r#"{"id":"old","title":"old","endpoint":"local","projectPath":"/tmp","status":"completed"}"#;
+        let session: SessionSummary = serde_json::from_str(legacy).unwrap();
+        assert!(session.current_agent.is_none());
+        assert!(session.last_models.is_empty());
+    }
+
+    #[test]
+    fn last_model_survives_after_the_current_agent_exits() {
+        let mut value = session("local", "/tmp");
+        apply_session_agent(
+            &mut value,
+            Some(crate::session::CliKind::Codex),
+            Some("gpt-test".to_owned()),
+        );
+        assert_eq!(value.model.as_deref(), Some("gpt-test"));
+        apply_session_agent(&mut value, None, None);
+        assert!(value.current_agent.is_none());
+        assert!(value.cli.is_none());
+        assert_eq!(
+            value.last_models["codex"].requested_model.as_deref(),
+            Some("gpt-test")
+        );
+    }
+
+    #[test]
+    fn effective_model_and_provider_session_replace_only_runtime_fields() {
+        let mut value = session("local", "/tmp");
+        apply_session_agent(
+            &mut value,
+            Some(crate::session::CliKind::Claude),
+            Some("sonnet".to_owned()),
+        );
+        apply_agent_metadata(
+            &mut value,
+            Some("provider-123".to_owned()),
+            Some("claude-sonnet-exact".to_owned()),
+        );
+        let info = value.current_agent.as_ref().unwrap();
+        assert_eq!(info.requested_model.as_deref(), Some("sonnet"));
+        assert_eq!(info.effective_model.as_deref(), Some("claude-sonnet-exact"));
+        assert_eq!(info.provider_session_id.as_deref(), Some("provider-123"));
+        assert!(matches!(info.source, AgentModelSource::SessionLog));
+        assert_eq!(value.model.as_deref(), Some("claude-sonnet-exact"));
     }
 }

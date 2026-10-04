@@ -8,6 +8,9 @@ export type SessionRecordDraft =
 export type SessionRecord = SessionRecordDraft & {
   id: string;
   profileId: string;
+  /** Milliseconds since the Unix epoch. */
+  createdAt: number;
+  updatedAt: number;
 };
 
 export const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'in progress', 'done'];
