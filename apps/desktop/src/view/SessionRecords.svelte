@@ -174,8 +174,8 @@
               <div class="record-actions">
                 {#if deletingId === record.id}
                   <span class="delete-prompt">Delete this note?</span>
-                  <button class="text-button" type="button" disabled={busy} onclick={() => { deletingId = null; }}>Cancel</button>
-                  <button class="text-button danger" type="button" disabled={busy} onclick={() => void remove(record)}>Delete</button>
+                  <button class="text-button" type="button" disabled={busy} onclick={() => { deletingId = null; }}>No</button>
+                  <button class="text-button danger" type="button" disabled={busy} onclick={() => void remove(record)}>Yes</button>
                 {:else}
                   <button class="text-button" type="button" disabled={busy} onclick={() => edit(record)}>Edit</button>
                   <button class="text-button danger" type="button" disabled={busy} onclick={() => { deletingId = record.id; }}>Delete</button>
@@ -201,8 +201,8 @@
               <div class="record-actions">
                 {#if deletingId === record.id}
                   <span class="delete-prompt">Delete this task?</span>
-                  <button class="text-button" type="button" disabled={busy} onclick={() => { deletingId = null; }}>Cancel</button>
-                  <button class="text-button danger" type="button" disabled={busy} onclick={() => void remove(record)}>Delete</button>
+                  <button class="text-button" type="button" disabled={busy} onclick={() => { deletingId = null; }}>No</button>
+                  <button class="text-button danger" type="button" disabled={busy} onclick={() => void remove(record)}>Yes</button>
                 {:else}
                   <button class="text-button" type="button" disabled={busy} onclick={() => edit(record)}>Edit</button>
                   <button class="text-button danger" type="button" disabled={busy} onclick={() => { deletingId = record.id; }}>Delete</button>

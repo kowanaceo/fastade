@@ -11,6 +11,7 @@ which owns the notes, tasks and sessions (and signs in to the account).
 
 Standard library only; mirrors src/bin/fastade_mcp.rs.
 """
+import glob
 import json
 import os
 import socket
@@ -19,8 +20,46 @@ import sys
 VERSION = "1"
 
 
-def send(request):
+def live_sockets():
+    """Forwarded app sockets that still accept connections, newest first."""
+    found = []
+    for path in glob.glob("/tmp/fastade-*.sock"):
+        try:
+            if os.stat(path).st_uid != os.getuid():
+                continue
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(2)
+                probe.connect(path)
+            found.append((os.stat(path).st_mtime, path))
+        except OSError:
+            continue
+    return [path for _, path in sorted(found, reverse=True)]
+
+
+def session_socket():
+    """$FASTADE_SOCK, or, for a CLI whose daemon started outside the session
+    shell (codex app-server) and so never inherited it, the newest live socket."""
     path = os.environ.get("FASTADE_SOCK")
+    if path:
+        return path
+    sockets = live_sockets()
+    return sockets[0] if sockets else None
+
+
+def session_id():
+    """$FASTADE_SESSION_ID, or the id in the socket name when only one session
+    is connected (with several, a guess could file a note under the wrong one)."""
+    value = os.environ.get("FASTADE_SESSION_ID")
+    if value:
+        return value
+    sockets = live_sockets()
+    if len(sockets) == 1:
+        return os.path.basename(sockets[0])[len("fastade-"):-len(".sock")]
+    return None
+
+
+def send(request):
+    path = session_socket()
     if not path:
         raise RuntimeError("not running inside a fastade session")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -58,9 +97,9 @@ def call_tool(params):
         return None, {"code": -32602, "message": "unknown tool: %s" % name}
     request = dict(params.get("arguments") or {})
     request.pop("session_id", None)
-    session_id = os.environ.get("FASTADE_SESSION_ID")
-    if session_id:
-        request["session_id"] = session_id
+    current = session_id()
+    if current:
+        request["session_id"] = current
     request["op"] = name
     try:
         reply = send(request)

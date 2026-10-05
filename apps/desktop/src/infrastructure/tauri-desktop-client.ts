@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { CreateSessionInput, DesktopClient, RemoteDirectoryListing, SaveSessionInput, SshHost, TerminalEvent } from '../application/desktop-client';
-import type { AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
+import type { AgentAccount, AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
 
 export class TauriDesktopClient implements DesktopClient {
   listSessions(): Promise<CliSessionSummary[]> {
@@ -141,8 +141,12 @@ export class TauriDesktopClient implements DesktopClient {
     return invoke<AgentUsage>('get_agent_usage', { agentId, force });
   }
 
-  getRemoteUsage(): Promise<UsageSnapshot[]> {
-    return invoke<UsageSnapshot[]>('get_remote_usage');
+  getLocalAccounts(): Promise<AgentAccount[]> {
+    return invoke<AgentAccount[]>('get_local_accounts');
+  }
+
+  getRemoteUsage(force = false): Promise<UsageSnapshot[]> {
+    return invoke<UsageSnapshot[]>('get_remote_usage', { force });
   }
 
   putUsageSnapshot(snapshot: UsageSnapshot): Promise<void> {

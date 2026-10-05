@@ -38,7 +38,7 @@ use session::{
     update_session_context, upload_file_to_session, write_terminal, AppState,
 };
 use ssh_config::list_ssh_hosts;
-use usage::{get_agent_usage, get_remote_usage};
+use usage::{get_agent_usage, get_local_accounts, get_remote_usage};
 use windows::{
     fit_window_after_resize, fit_windows_after_display_change, open_session_window,
     watch_display_changes,
@@ -92,6 +92,7 @@ pub fn run() {
             open_session_window,
             get_agent_usage,
             get_remote_usage,
+            get_local_accounts,
             auth::put_usage_snapshot,
             auth::list_usage_snapshots,
             session_memory_usage,

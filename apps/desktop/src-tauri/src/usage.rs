@@ -728,14 +728,64 @@ pub struct UsageSnapshot {
     agent_id: String,
     host_id: String,
     host_label: String,
+    /// The provider account the limits belong to; hosts signed in to the same
+    /// account share one set of limits, so this is what groups them.
+    account_id: Option<String>,
     collected_at: i64,
     windows: Vec<UsageWindow>,
+}
+
+/// Who an agent is signed in to on this device: a stable id plus something
+/// readable (the email) when the provider's files hold one.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAccount {
+    agent_id: String,
+    account_id: String,
+    label: Option<String>,
+}
+
+fn codex_account() -> Option<AgentAccount> {
+    let path = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?
+        .join("auth.json");
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let tokens = json.get("tokens")?;
+    let account_id = tokens.get("account_id")?.as_str()?.to_owned();
+    let label = tokens
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(|jwt| jwt.split('.').nth(1))
+        .and_then(|part| {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part.trim_end_matches('=')).ok()
+        })
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|claims| claims.get("email").and_then(Value::as_str).map(str::to_owned));
+    Some(AgentAccount { agent_id: "codex".to_owned(), account_id, label })
+}
+
+fn claude_account() -> Option<AgentAccount> {
+    let path = dirs::home_dir()?.join(".claude.json");
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let account = json.get("oauthAccount")?;
+    Some(AgentAccount {
+        agent_id: "claude".to_owned(),
+        account_id: account.get("accountUuid")?.as_str()?.to_owned(),
+        label: account.get("emailAddress").and_then(Value::as_str).map(str::to_owned),
+    })
+}
+
+#[tauri::command]
+pub fn get_local_accounts() -> Vec<AgentAccount> {
+    [codex_account(), claude_account()].into_iter().flatten().collect()
 }
 
 /// Prints the newest Codex limits line on a host. A unix socket is not needed:
 /// the desktop app runs this over its ordinary ssh exec, so the host stores
 /// nothing and holds no credential.
-const REMOTE_CODEX_SCRIPT: &str = r#"d="${CODEX_HOME:-$HOME/.codex}/sessions"; [ -d "$d" ] || exit 0; find "$d" -name 'rollout-*.jsonl' -type f 2>/dev/null | sort -r | head -8 | while IFS= read -r f; do l=$(tail -c 262144 "$f" | grep '"rate_limits"' | tail -1); if [ -n "$l" ]; then printf '%s\n' "$l"; break; fi; done"#;
+const REMOTE_CODEX_SCRIPT: &str = r#"h="${CODEX_HOME:-$HOME/.codex}"; d="$h/sessions"; [ -d "$d" ] || exit 0; a=$(grep -o '"account_id" *: *"[^"]*"' "$h/auth.json" 2>/dev/null | head -1 | sed 's/.*: *"\(.*\)"/\1/'); [ -n "$a" ] && printf 'ACCOUNT %s\n' "$a"; find "$d" -name 'rollout-*.jsonl' -type f 2>/dev/null | sort -r | head -8 | while IFS= read -r f; do l=$(tail -c 262144 "$f" | grep '"rate_limits"' | tail -1); if [ -n "$l" ]; then printf '%s\n' "$l"; break; fi; done"#;
 
 /// Stable, URL-safe id for a host the account keys snapshots by.
 pub(crate) fn remote_host_id(endpoint: &str) -> String {
@@ -770,11 +820,17 @@ pub async fn get_remote_usage(
                     let output =
                         crate::remote_fs::run_remote_script(&endpoint, REMOTE_CODEX_SCRIPT, &app)
                             .ok()?;
+                    let account_id = output
+                        .lines()
+                        .find_map(|line| line.strip_prefix("ACCOUNT "))
+                        .map(|id| id.trim().to_owned())
+                        .filter(|id| !id.is_empty());
                     let (windows, collected_at) = codex_usage_from_log(&output, now_unix())?;
                     Some(UsageSnapshot {
                         agent_id: "codex".to_owned(),
                         host_id: remote_host_id(&endpoint),
                         host_label: remote_host_label(&app, &endpoint),
+                        account_id,
                         collected_at,
                         windows,
                     })

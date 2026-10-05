@@ -334,6 +334,14 @@ fn read_session() -> Option<BackendSession> {
         .and_then(|value| serde_json::from_str(&value).ok())
 }
 
+/// Remote MCP access is available only while this device has a Fastade
+/// account session. The credential itself stays in the OS keychain; callers
+/// use this only as an enablement check and must never copy it to a remote
+/// shell or config file.
+pub(crate) fn is_signed_in() -> bool {
+    read_session().is_some()
+}
+
 fn write_session(session: &BackendSession) -> Result<(), String> {
     let value = serde_json::to_string(session).map_err(|error| error.to_string())?;
     session_entry()?

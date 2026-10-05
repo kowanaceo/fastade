@@ -82,8 +82,12 @@ button.upload { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #3e5f49; bor
 .records-dialog { width: min(760px, 100%); max-height: min(720px, calc(100vh - 48px)); overflow: auto; border: 1px solid #3b4b41; border-radius: 14px; background: #101512; box-shadow: 0 24px 80px #000d; }
 .agent-model-inline input { width: 108px; height: 24px; padding: 0 4px; border: 1px solid #344139; border-radius: 5px; color: #d3dbd6; background: #172019; font-size: 9px; text-transform: none; }
 
-.usage-host { display: flex; align-items: baseline; gap: 8px; margin-top: 3px; padding-left: 13px; color: #78857c; font-size: 9px; white-space: nowrap; }
-.usage-host b { color: #aab6ae; font-weight: 650; }
-.usage-host .usage-host-name { flex: 0 1 auto; overflow: hidden; color: #98a49c; text-overflow: ellipsis; }
-.usage-host small { margin-left: auto; color: #5f6b64; font-size: 8px; }
-.usage-host.stale { opacity: .55; }
+.usage-host-head { padding-left: 13px; color: #78857c; font-size: 9px; display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+.usage-host-name { flex: 0 1 auto; overflow: hidden; color: #98a49c; text-overflow: ellipsis; }
+.usage-host-head small { margin-left: auto; color: #5f6b64; font-size: 8px; }
+.agent-usage-row.stale { opacity: .55; }
+
+button.upload:has(.records-icon) { position: relative; }
+.records-icon { display: block; width: 13px; height: 13px; }
+.task-badge { position: absolute; top: -6px; right: -6px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px; box-sizing: border-box; color: #0c110e; background: #8eefaa; font-size: 9px; font-weight: 800; line-height: 14px; text-align: center; }
+.session-select .task-count { display: inline-block; min-width: 14px; height: 14px; margin-left: 6px; padding: 0 4px; border-radius: 7px; box-sizing: border-box; color: #0c110e; background: #8eefaa; font-size: 9px; font-weight: 800; line-height: 14px; text-align: center; vertical-align: 1px; }

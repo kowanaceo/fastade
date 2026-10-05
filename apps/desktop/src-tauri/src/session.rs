@@ -618,13 +618,18 @@ fn spawn_terminal(
             },
             password,
         });
-    let forward_socket = (session.endpoint != "local")
+    // A remote host gets access to the desktop MCP socket only for signed-in
+    // users. No account token is sent over SSH: the remote bridge talks over
+    // this per-session socket and the desktop app keeps credentials in the OS
+    // keychain.
+    let remote_mcp_enabled = remote_mcp_enabled(&session.endpoint, crate::auth::is_signed_in());
+    let forward_socket = remote_mcp_enabled
         .then(crate::mcp::socket_path)
         .flatten()
         .filter(|path| path.exists());
     let (command, autofill_password) =
         build_command(session, managed_connection.as_ref(), forward_socket.as_deref())?;
-    if session.endpoint != "local" && forward_socket.is_some() {
+    if remote_mcp_enabled && forward_socket.is_some() {
         crate::remote_mcp::ensure_installed_in_background(&app, &session.endpoint);
     }
     let mut child = pair
@@ -808,6 +813,10 @@ fn build_command(
         command.arg(format!("{enter}exec \"${{SHELL:-/bin/sh}}\" -l"));
     }
     Ok((command, password))
+}
+
+fn remote_mcp_enabled(endpoint: &str, signed_in: bool) -> bool {
+    endpoint != "local" && signed_in
 }
 
 fn local_shell() -> String {
@@ -1310,8 +1319,8 @@ pub(crate) fn shell_quote(value: &str) -> String {
 mod tests {
     use super::{
         apply_agent_metadata, apply_session_agent, build_command, merge_mcp_sessions,
-        resolve_program, shell_quote, AgentModelSource, ManagedConnection, SessionStatus,
-        SessionSummary, Utf8StreamDecoder,
+        remote_mcp_enabled, resolve_program, shell_quote, AgentModelSource, ManagedConnection,
+        SessionStatus, SessionSummary, Utf8StreamDecoder,
     };
     use crate::saved_sessions::SavedSession;
     use std::collections::HashMap;
@@ -1463,6 +1472,13 @@ mod tests {
         // Even a bare home session needs the environment to reach the bridge.
         let (home, _) = build_command(&session("kowanas.dev", "~"), None, Some(std::path::Path::new("/s"))).unwrap();
         assert!(home.get_argv().last().unwrap().to_string_lossy().starts_with("exec env FASTADE_SESSION_ID="));
+    }
+
+    #[test]
+    fn remote_mcp_requires_a_signed_in_remote_session() {
+        assert!(remote_mcp_enabled("kowanas.dev", true));
+        assert!(!remote_mcp_enabled("kowanas.dev", false));
+        assert!(!remote_mcp_enabled("local", true));
     }
 
     #[test]

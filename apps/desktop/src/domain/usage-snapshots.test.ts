@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { AgentUsage, UsageSnapshot } from './session.ts';
-import { localHostId, localSnapshot, mergeHostUsage, parseSnapshotList, shouldUpload, snapshotAge, windowsKey } from './usage-snapshots.ts';
+import { localHostId, localSnapshot, mergeHostUsage, parseSnapshotList, shouldUpload, snapshotAge, unlistedAgentIds, windowsKey } from './usage-snapshots.ts';
 
 const windows = [{ label: '5h', remainingPercent: 72, resetsAt: 100 }];
 const snap = (host: string, at: number, agentId = 'codex'): UsageSnapshot => ({ agentId, hostId: host, hostLabel: host, collectedAt: at, windows });
@@ -46,4 +46,16 @@ test('age labels and staleness', () => {
   assert.deepEqual(snapshotAge(1000, 1000 + 600), { label: '10m ago', stale: false });
   assert.deepEqual(snapshotAge(1000, 1000 + 7200), { label: '2h ago', stale: true });
   assert.deepEqual(snapshotAge(1000, 1000 + 3 * 86_400), { label: '3d ago', stale: true });
+});
+
+test('snapshots of agents without a row are still listed', () => {
+  const all = [snap('a', 1), snap('a', 2, 'claude'), snap('b', 3, 'aider'), snap('c', 4, 'aider')];
+  assert.deepEqual(unlistedAgentIds(all, ['codex']), ['aider', 'claude']);
+  assert.deepEqual(unlistedAgentIds(all, ['codex', 'claude', 'aider']), []);
+});
+
+test('hosts on one account collapse into a single entry, and this device\'s account is dropped', () => {
+  const acct = (host: string, at: number, accountId?: string): UsageSnapshot => ({ ...snap(host, at), accountId });
+  const merged = mergeHostUsage([[acct('backend', 5, 'A'), acct('dev', 9, 'A'), acct('other', 3, 'B'), acct('mine', 4, 'ME')]], 'own', [{ agentId: 'codex', accountId: 'ME' }]);
+  assert.deepEqual(merged.map((s) => [s.hostLabel, s.collectedAt]), [['backend, dev', 9], ['other', 3]]);
 });

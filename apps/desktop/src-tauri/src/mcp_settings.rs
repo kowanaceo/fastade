@@ -351,6 +351,11 @@ fn set_codex_toml_at(path: &Path, enabled: bool, binary: &Path) -> Result<(), St
         let mut table = toml_edit::Table::new();
         table["command"] = toml_edit::value(binary.to_string_lossy().into_owned());
         table["args"] = toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new()));
+        // Codex starts MCP servers with a trimmed environment; without this the
+        // SSH bridge never sees the forwarded socket and reports "failed".
+        table["env_vars"] = toml_edit::Item::Value(toml_edit::Value::Array(
+            ["FASTADE_SOCK", "FASTADE_SESSION_ID"].into_iter().collect(),
+        ));
         doc["mcp_servers"]["fastade"] = toml_edit::Item::Table(table);
     } else if let Some(servers) = doc
         .get_mut("mcp_servers")
@@ -487,6 +492,13 @@ mod tests {
             doc["mcp_servers"]["fastade"]["command"].as_str().unwrap(),
             "/usr/local/bin/fastade_mcp"
         );
+        let env_vars: Vec<_> = doc["mcp_servers"]["fastade"]["env_vars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(env_vars, ["FASTADE_SOCK", "FASTADE_SESSION_ID"]);
 
         set_codex_toml_at(&path, false, Path::new("/usr/local/bin/fastade_mcp")).unwrap();
         let contents = fs::read_to_string(&path).unwrap();

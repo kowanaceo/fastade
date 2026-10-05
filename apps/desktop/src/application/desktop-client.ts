@@ -1,4 +1,4 @@
-import type { AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
+import type { AgentAccount, AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
 
 export interface CreateSessionInput {
   title: string;
@@ -63,8 +63,10 @@ export interface DesktopClient {
   openSessionWindow(sessionId: string): Promise<void>;
   /** `force` skips the short-lived cache of Claude's slow-to-read limits. */
   getAgentUsage(agentId: string, force?: boolean): Promise<AgentUsage>;
-  /** Codex limits of every SSH host with a live session. */
-  getRemoteUsage(): Promise<UsageSnapshot[]>;
+  /** Codex limits of every SSH host with a live session. `force` asks the host
+   * for live limits instead of relying only on its latest session log. */
+  getRemoteUsage(force?: boolean): Promise<UsageSnapshot[]>;
+  getLocalAccounts(): Promise<AgentAccount[]>;
   putUsageSnapshot(snapshot: UsageSnapshot): Promise<void>;
   listUsageSnapshots(): Promise<unknown>;
   sessionMemoryUsage(): Promise<Record<string, number>>;

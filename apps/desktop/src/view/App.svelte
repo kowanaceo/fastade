@@ -3,7 +3,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { createDesktopClient } from '../application/client-provider';
   import { type CliKind, type WebAgent } from '../domain/session';
-  import { snapshotAge } from '../domain/usage-snapshots';
+  import { snapshotAge, unlistedAgentIds } from '../domain/usage-snapshots';
   import { AppViewModel } from '../viewmodel/app-view-model.svelte';
   import { TauriSessionRecordRepository } from '../infrastructure/tauri-session-record-repository';
   import RemoteFolderPicker from './RemoteFolderPicker.svelte';
@@ -19,6 +19,24 @@
       : 'Synced with your account.',
   );
   let recordsTarget = $state<{ profileId: string; name: string } | null>(null);
+  // Open (not done) tasks per saved session profile, for the badge on the
+  // notes button. Reloads when records change from a sync, MCP, or the dialog.
+  let openTaskCounts = $state<Record<string, number>>({});
+  let localRecordsRevision = $state(0);
+  $effect(() => {
+    void viewModel.recordsRevision;
+    void localRecordsRevision;
+    let current = true;
+    void recordRepository.listAll().then((records) => {
+      if (!current) return;
+      const counts: Record<string, number> = {};
+      for (const record of records) {
+        if (record.kind === 'task' && record.status !== 'done') counts[record.profileId] = (counts[record.profileId] ?? 0) + 1;
+      }
+      openTaskCounts = counts;
+    }).catch(() => {});
+    return () => { current = false; };
+  });
   const poppedSessionId = new URLSearchParams(window.location.search).get('session');
   const cliNames: Record<CliKind, string> = { codex: 'Codex', gemini: 'Gemini', claude: 'Claude Code' };
   const activityLabels: Record<'working' | 'waiting' | 'idle', string> = {
@@ -278,6 +296,21 @@
 
 <svelte:head><title>fastade</title></svelte:head>
 
+{#snippet hostRows(agentId: string, name: string, accent: string)}
+  {#each viewModel.hostUsage.filter((host) => host.agentId === agentId) as host (host.hostId)}
+    {@const age = snapshotAge(host.collectedAt, Math.floor(clockNow.getTime() / 1000))}
+    <div class="agent-usage-row" class:stale={age.stale} style={`--agent-accent:${accent}`} title={`${host.hostLabel} · updated ${age.label}`}>
+      <div class="agent-launch"><span class="agent-dot"></span><strong>{name}</strong></div>
+      <div class="usage-host-head"><span class="usage-host-name">{host.hostLabel}</span><small>{age.label}</small></div>
+      {#each host.windows as window}
+        <div class="usage-meter" title={`${window.label} ${window.remainingPercent}% remaining`}>
+          <span>{window.label}</span><div><i style={`width:${window.remainingPercent}%`}></i></div><b>{window.remainingPercent}%</b><small title={window.resetText ?? ''}>{window.resetText ?? formatReset(window.resetsAt)}</small>
+        </div>
+      {/each}
+    </div>
+  {/each}
+{/snippet}
+
 <div class:drawer-closed={!viewModel.drawerOpen || poppedSessionId} class="shell">
   {#if viewModel.drawerOpen && !poppedSessionId}
     <aside aria-label="Session drawer">
@@ -310,15 +343,11 @@
               {:else}
                 <div class="usage-unavailable"><span>{usage?.message ?? 'Checking…'}</span></div>
               {/if}
-              {#each viewModel.hostUsage.filter((host) => host.agentId === agent.id) as host (host.hostId)}
-                {@const age = snapshotAge(host.collectedAt, Math.floor(clockNow.getTime() / 1000))}
-                <div class="usage-host" class:stale={age.stale} title={`${host.hostLabel} · updated ${age.label}`}>
-                  <span class="usage-host-name">{host.hostLabel}</span>
-                  {#each host.windows as window}<span>{window.label} <b>{window.remainingPercent}%</b></span>{/each}
-                  <small>{age.label}</small>
-                </div>
-              {/each}
             </div>
+            {@render hostRows(agent.id, agent.name, agent.accent)}
+          {/each}
+          {#each unlistedAgentIds(viewModel.hostUsage, viewModel.webAgents.filter((agent) => agent.enabled).map((agent) => agent.id)) as agentId (agentId)}
+            {@render hostRows(agentId, viewModel.webAgents.find((agent) => agent.id === agentId)?.name ?? agentId, '#718078')}
           {/each}
         {/if}
       </section>
@@ -356,6 +385,7 @@
           <button type="submit" aria-label="Add group" title="Add group">+</button>
         </form>
         {#each viewModel.sessionGroups as group (group.id)}
+          {@const groupTasks = [...new Set(group.entries.flatMap((entry) => entry.profileId ?? []))].reduce((sum, id) => sum + (openTaskCounts[id] ?? 0), 0)}
           <section
             role="group"
             aria-label={`${group.name} session group`}
@@ -372,7 +402,7 @@
             <div class="group-header">
               <button class="group-select" aria-pressed={group.id === viewModel.selectedGroupId} onclick={() => viewModel.selectGroup(group.id)} oncontextmenu={(event) => openGroupMenu(event, group.id, group.name)}>
                 <strong>{group.name}</strong>
-                <span class="group-count" aria-label={`${group.entries.length} sessions`}>{group.entries.length}</span>
+                {#if groupTasks}<span class="group-count" aria-label={`${groupTasks} open tasks`} title={`${groupTasks} open tasks in this group`}>{groupTasks}</span>{/if}
               </button>
               <button
                 class="group-collapse-target"
@@ -413,7 +443,7 @@
                       {:else}
                         <span class="status" data-status={entry.status}></span>
                       {/if}
-                      <span><strong>{entry.title}</strong><small>{entry.endpoint === 'local' ? 'local' : `ssh:${viewModel.endpointLabel(entry.endpoint)}`} · {entry.projectPath}{entry.cli ? ` · ${cliNames[entry.cli]}` : ''}</small></span>
+                      <span><strong>{entry.title}{#if entry.profileId && openTaskCounts[entry.profileId]}<span class="task-count" aria-label={`${openTaskCounts[entry.profileId]} open tasks`} title={`${openTaskCounts[entry.profileId]} open tasks`}>{openTaskCounts[entry.profileId]}</span>{/if}</strong><small>{entry.endpoint === 'local' ? 'local' : `ssh:${viewModel.endpointLabel(entry.endpoint)}`} · {entry.projectPath}{entry.cli ? ` · ${cliNames[entry.cli]}` : ''}</small></span>
                     </button>
                     {#if entry.sessionId}
                       {@const session = viewModel.sessions.find((item) => item.id === entry.sessionId)}
@@ -473,6 +503,7 @@
           {@const activity = viewModel.activityFor(session.id)}
           {@const memoryLabel = viewModel.memoryLabelFor(session.id)}
           {@const recordProfile = viewModel.profileForSession(session)}
+          {@const openTasks = recordProfile ? openTaskCounts[recordProfile.id] ?? 0 : 0}
           <article data-session-id={session.id} hidden={!poppedSessionId && !visibleSessions.some((visible) => visible.id === session.id)} role="group" aria-label={`${session.title} terminal session`} class:active={session.id === viewModel.selectedSessionId} class:grid-left={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id === session.id} class:grid-right={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id !== session.id && visibleSessions.some((visible) => visible.id === session.id)} class="session-card" oncontextmenu={(event) => openSessionMenu(event, session.id)}>
             <header class="card-header">
               <div class="session-identity"><span class="cli-badge">{session.cli ? session.cli.slice(0, 1).toUpperCase() : '$'}</span><strong title={session.title}>{session.title}</strong><span class="agent">{session.cli ? `${cliNames[session.cli]}${session.model ? ` · ${session.model}` : ''}` : 'shell'}</span>
@@ -480,7 +511,7 @@
                 {#if memoryLabel}<span class="memory-chip" title="Resident memory used by this session's shell and its child processes">{memoryLabel}</span>{/if}
                 <span title={session.endpoint}>⌁ {viewModel.endpointLabel(session.endpoint)}</span>
                 <button class="folder folder-confirm" disabled={agentRunning} title={agentRunning ? 'Stop the running agent (■) before changing folders' : `${session.projectPath} — click to change folder (also renames the session)`} onclick={(event) => { event.stopPropagation(); void viewModel.changeFolder(session.id); }}>⌂ {session.projectPath}</button>
-                <button class="upload" disabled={!recordProfile} title={recordProfile ? 'Notes and tasks for this project (stored on this device)' : 'Keep this session in Ungrouped (+) to attach notes and tasks'} aria-label={`Notes and tasks for ${session.title}`} onclick={(event) => { event.stopPropagation(); if (recordProfile) recordsTarget = { profileId: recordProfile.id, name: recordProfile.name }; }}>✎</button>
+                <button class="upload" disabled={!recordProfile} title={recordProfile ? 'Notes and tasks for this project (stored on this device)' : 'Keep this session in Ungrouped (+) to attach notes and tasks'} aria-label={`Notes and tasks for ${session.title}${openTasks ? `, ${openTasks} open` : ''}`} onclick={(event) => { event.stopPropagation(); if (recordProfile) recordsTarget = { profileId: recordProfile.id, name: recordProfile.name }; }}><svg class="records-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3.5l1.2 1.2L6.4 2.5M3 8.5l1.2 1.2L6.4 7.5M3 13.5l1.2 1.2 2.2-2.2M8.5 4h5M8.5 9h5M8.5 14h5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>{#if openTasks}<span class="task-badge">{openTasks > 99 ? '99+' : openTasks}</span>{/if}</button>
                 <button class="upload" disabled={viewModel.uploadingFiles[session.id]} title={session.endpoint === 'local' ? 'Upload files — copies them into this session’s folder' : 'Upload files — sends them into this session’s folder over SSH'} onclick={(event) => { event.stopPropagation(); void viewModel.uploadFiles(session.id); }}>{viewModel.uploadingFiles[session.id] ? '⇪…' : '⇪'}</button>
                 <span class="state" data-status={session.status}>{session.status}</span>
                 {#if !agentRunning && session.status === 'running'}
@@ -541,7 +572,7 @@
   <div class="settings-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) recordsTarget = null; }}>
     <div class="records-dialog" role="dialog" aria-modal="true" aria-label="Notes and tasks">
       {#key recordsTarget.profileId}
-        <SessionRecords profileId={recordsTarget.profileId} sessionName={recordsTarget.name} repository={recordRepository} revision={viewModel.recordsRevision} syncNote={recordSyncNote} onChanged={() => viewModel.requestSync()} onClose={() => { recordsTarget = null; }} />
+        <SessionRecords profileId={recordsTarget.profileId} sessionName={recordsTarget.name} repository={recordRepository} revision={viewModel.recordsRevision} syncNote={recordSyncNote} onChanged={() => { localRecordsRevision += 1; viewModel.requestSync(); }} onClose={() => { recordsTarget = null; }} />
       {/key}
     </div>
   </div>

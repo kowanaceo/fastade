@@ -111,10 +111,18 @@ export interface AgentUsage {
 
 /** One host's limits at `collectedAt` (epoch seconds), as the account stores
  * them for other devices to show. */
+export interface AgentAccount {
+  agentId: string;
+  accountId: string;
+  label?: string;
+}
+
 export interface UsageSnapshot {
   agentId: string;
   hostId: string;
   hostLabel: string;
+  /** Provider account the limits belong to; hosts on one account share them. */
+  accountId?: string;
   collectedAt: number;
   windows: UsageWindow[];
 }

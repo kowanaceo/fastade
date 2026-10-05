@@ -2,7 +2,7 @@ import type { DesktopClient, SshHost, TerminalEvent } from '../application/deskt
 import { localHostId, localSnapshot, mergeHostUsage, parseSnapshotList, shouldUpload, windowsKey } from '../domain/usage-snapshots';
 import { syncSessionRecords } from '../application/session-record-sync';
 import type { SessionRecordRepository } from '../application/session-record-repository';
-import { type AgentModelOption, type AgentUsage, type AuthUser, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type SyncEntity, type SyncPushChange, type UpdateServerInput, type UsageSnapshot, type WebAgent } from '../domain/session';
+import { type AgentAccount, type AgentModelOption, type AgentUsage, type AuthUser, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type SyncEntity, type SyncPushChange, type UpdateServerInput, type UsageSnapshot, type WebAgent } from '../domain/session';
 import { detectAgentActivity, type AgentActivity } from './activity-detector';
 import { detectAgentLaunch } from './agent-command';
 
@@ -493,19 +493,22 @@ export class AppViewModel {
       }
     }));
     this.agentUsage = Object.fromEntries(entries);
-    await this.refreshHostUsage();
+    await this.refreshHostUsage(force);
   }
 
   /** Adds what this device cannot see itself: SSH hosts with a live session
    * and, when signed in, the account's snapshots from other devices. Signed
    * out, or against a server without usage sync, only the local view remains. */
-  private async refreshHostUsage(): Promise<void> {
+  private async refreshHostUsage(force = false): Promise<void> {
     const now = Math.floor(Date.now() / 1000);
     let remote: UsageSnapshot[] = [];
-    try { remote = await this.client.getRemoteUsage(); } catch { /* no live ssh session, or the host is unreachable */ }
+    try { remote = await this.client.getRemoteUsage(force); } catch { /* no live ssh session, or the host is unreachable */ }
+    let accounts: AgentAccount[] = [];
+    try { accounts = await this.client.getLocalAccounts(); } catch { /* no signed-in CLI */ }
+    const accountOf = (agentId: string) => accounts.find((account) => account.agentId === agentId)?.accountId;
     let shared: UsageSnapshot[] = [];
+    const local = Object.entries(this.agentUsage).flatMap(([id, usage]) => localSnapshot(id, usage, this.authDeviceId, now, accountOf(id)) ?? []);
     if (this.authUser && this.authDeviceId) {
-      const local = Object.entries(this.agentUsage).flatMap(([id, usage]) => localSnapshot(id, usage, this.authDeviceId, now) ?? []);
       try {
         for (const snapshot of [...local, ...remote]) {
           const key = `${snapshot.agentId}\n${snapshot.hostId}`;
@@ -516,7 +519,7 @@ export class AppViewModel {
         shared = parseSnapshotList(await this.client.listUsageSnapshots());
       } catch { /* usage sync is optional: keep showing the local view */ }
     }
-    this.hostUsage = mergeHostUsage([remote, shared], localHostId(this.authDeviceId));
+    this.hostUsage = mergeHostUsage([remote, shared], localHostId(this.authDeviceId), accounts, local);
   }
 
   async refreshAgentModels(endpoint = 'local', onlyCli?: CliKind): Promise<void> {
@@ -673,6 +676,7 @@ export class AppViewModel {
       });
       this.sessions = [created, ...this.sessions];
       void this.syncSessionStatuses();
+      if (server !== 'local') void this.refreshHostUsage(true);
       if (targetGroupId !== UNGROUPED_ID) {
         const profile = await this.ensureProfile(created);
         this.sessionGroupIds = { ...this.sessionGroupIds, [created.id]: targetGroupId };
@@ -928,6 +932,7 @@ export class AppViewModel {
    * `/chat save` checkpoints rather than the last conversation automatically. */
   private async restorePinnedSessions(): Promise<void> {
     const pinned = this.sessions.filter((session) => this.isSessionPinned(session.id));
+    let connectedRemote = false;
     for (const saved of pinned) {
       try {
         let restored = saved;
@@ -936,6 +941,7 @@ export class AppViewModel {
           this.sessions = this.sessions.map((session) => session.id === saved.id ? restored : session);
           void this.syncSessionStatuses();
         }
+        if (restored.endpoint !== 'local') connectedRemote = true;
         if (!restored.cli) {
           this.installShellHook(saved.id);
           continue;
@@ -960,6 +966,7 @@ export class AppViewModel {
         this.error = `Could not restore ${saved.title}: ${this.message(error)}`;
       }
     }
+    if (connectedRemote) void this.refreshHostUsage(true);
   }
 
   /** ■: quit the running agent and drop back to the shell prompt. All three
@@ -1051,6 +1058,7 @@ export class AppViewModel {
       const reconnected = await this.client.reconnectSession(sessionId);
       this.sessions = this.sessions.map((session) => session.id === sessionId ? reconnected : session);
       void this.syncSessionStatuses();
+      if (reconnected.endpoint !== 'local') void this.refreshHostUsage(true);
       this.installShellHook(sessionId);
       this.selectSession(sessionId);
     } catch (error) {
