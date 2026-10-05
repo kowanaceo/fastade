@@ -3,6 +3,7 @@
 //! tool call is forwarded over a local unix socket to the already-running
 //! fastade desktop app, which actually owns the sessions. This binary holds
 //! no session state itself — it is only a protocol bridge.
+use fastade_desktop_lib::mcp::tool_definitions;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
@@ -13,7 +14,8 @@ fn main() {
         // status update, then exit immediately so the hook never blocks the
         // CLI it's attached to.
         let state = args.get(2).map(String::as_str).unwrap_or("idle");
-        report_activity(hook_state(state));
+        let payload = read_hook_payload(args.get(3).map(String::as_str));
+        report_activity(hook_state(state, payload.as_deref()), payload.as_deref());
         // Codex Stop/Interrupt hooks require successful command hooks to
         // return a JSON object. An empty object is also harmless for Claude
         // hooks and for Codex's legacy `notify` callback.
@@ -61,19 +63,20 @@ fn handle_message(message: Value) -> Option<Value> {
     })
 }
 
-fn tool_definitions() -> Value {
-    json!([
-        {
-            "name": "list_sessions",
-            "description": "Return every saved fastade session, local or remote (SSH), overlaid with runtime session ID, agent, model, status, hook-reported activity and memory usage when available. Saved entries that have not been opened are returned as disconnected.",
-            "inputSchema": { "type": "object", "properties": {} }
-        },
-        {
-            "name": "list_projects",
-            "description": "Return every project shown in fastade, one entry per saved project, with its name, current endpoint, project path, and paths remembered for other devices.",
-            "inputSchema": { "type": "object", "properties": {} }
-        }
-    ])
+/// Notes and tasks only: session control (sending input, stopping agents)
+/// stays out of MCP on purpose.
+const RECORD_TOOLS: [&str; 4] = ["list_records", "create_record", "update_record", "delete_record"];
+
+/// The tool arguments plus the caller's own fastade session, so a record
+/// lands on the session the agent is working in without it knowing any ids.
+fn record_request(name: &str, arguments: &Value) -> Value {
+    let mut request = arguments.as_object().cloned().unwrap_or_default();
+    request.insert("op".to_owned(), json!(name));
+    request.remove("session_id");
+    if let Ok(session_id) = std::env::var("FASTADE_SESSION_ID") {
+        request.insert("session_id".to_owned(), json!(session_id));
+    }
+    Value::Object(request)
 }
 
 fn call_tool(params: Value) -> Result<Value, Value> {
@@ -84,6 +87,9 @@ fn call_tool(params: Value) -> Result<Value, Value> {
     let request = match name {
         "list_sessions" => json!({ "op": "list_sessions" }),
         "list_projects" => json!({ "op": "list_projects" }),
+        record if RECORD_TOOLS.contains(&record) => {
+            record_request(record, params.get("arguments").unwrap_or(&Value::Null))
+        }
         other => {
             return Err(json!({ "code": -32602, "message": format!("unknown tool: {other}") }))
         }
@@ -91,7 +97,11 @@ fn call_tool(params: Value) -> Result<Value, Value> {
 
     let response =
         send_to_app(&request).map_err(|error| json!({ "code": -32000, "message": error }))?;
-    Ok(json!({ "content": [{ "type": "text", "text": response.to_string() }] }))
+    let failed = response.get("ok") == Some(&Value::Bool(false));
+    Ok(json!({
+        "content": [{ "type": "text", "text": response.to_string() }],
+        "isError": failed,
+    }))
 }
 
 /// Claude Code's AskUserQuestion arrives as an ordinary PreToolUse (mapped to
@@ -99,24 +109,34 @@ fn call_tool(params: Value) -> Result<Value, Value> {
 /// The hook payload on stdin names the tool, so promote that one to
 /// `waiting`. stdin is only read for `working` hooks and never from a
 /// terminal, so a manual run or Codex's `notify` callback cannot block here.
-fn hook_state(state: &str) -> &str {
-    use std::io::{IsTerminal, Read};
-
-    if state != "working" || io::stdin().is_terminal() {
+fn hook_state<'a>(state: &'a str, payload: Option<&str>) -> &'a str {
+    if state != "working" {
         return state;
     }
-    let mut payload = String::new();
-    if io::stdin().take(1 << 20).read_to_string(&mut payload).is_err() {
-        return state;
-    }
-    let tool = serde_json::from_str::<Value>(&payload)
-        .ok()
+    let tool = payload
+        .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
         .and_then(|value| value.get("tool_name")?.as_str().map(str::to_owned));
     if is_user_question_tool(tool.as_deref()) {
         "waiting"
     } else {
         state
     }
+}
+
+fn read_hook_payload(argument: Option<&str>) -> Option<String> {
+    use std::io::{IsTerminal, Read};
+    if let Some(argument) = argument.filter(|value| value.trim_start().starts_with('{')) {
+        return Some(argument.to_owned());
+    }
+    if io::stdin().is_terminal() {
+        return None;
+    }
+    let mut payload = String::new();
+    io::stdin()
+        .take(1 << 20)
+        .read_to_string(&mut payload)
+        .ok()?;
+    (!payload.trim().is_empty()).then_some(payload)
 }
 
 fn is_user_question_tool(tool: Option<&str>) -> bool {
@@ -126,20 +146,77 @@ fn is_user_question_tool(tool: Option<&str>) -> bool {
 /// Silently does nothing if `$FASTADE_SESSION_ID` is unset (not run inside a
 /// fastade session) or the app is not running — a hook must never fail the
 /// CLI turn it is attached to just because the status update didn't land.
-fn report_activity(state: &str) {
+fn report_activity(state: &str, payload: Option<&str>) {
     let Ok(session_id) = std::env::var("FASTADE_SESSION_ID") else {
         return;
     };
-    let request = json!({ "op": "report_activity", "session_id": session_id, "state": state });
+    let hook = payload.and_then(|payload| serde_json::from_str::<Value>(payload).ok());
+    let provider_session_id = hook.as_ref().and_then(|value| {
+        value
+            .get("session_id")
+            .or_else(|| value.get("sessionId"))
+            .and_then(Value::as_str)
+    });
+    let transcript_path = hook.as_ref().and_then(|value| {
+        value
+            .get("transcript_path")
+            .or_else(|| value.get("transcriptPath"))
+            .and_then(Value::as_str)
+    });
+    let effective_model = transcript_path.and_then(read_effective_model).or_else(|| {
+        hook.as_ref().and_then(|value| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    });
+    let request = json!({
+        "op": "report_activity",
+        "session_id": session_id,
+        "state": state,
+        "provider_session_id": provider_session_id,
+        "effective_model": effective_model,
+    });
     let _ = send_to_app(&request);
+}
+
+fn read_effective_model(path: &str) -> Option<String> {
+    use std::{
+        fs::File,
+        io::{Read, Seek, SeekFrom},
+    };
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(1024 * 1024);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    contents
+        .lines()
+        .filter_map(|line| {
+            let value = serde_json::from_str::<Value>(line).ok()?;
+            value
+                .pointer("/payload/model")
+                .or_else(|| value.pointer("/message/model"))
+                .or_else(|| value.get("model"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .last()
 }
 
 #[cfg(unix)]
 fn send_to_app(request: &Value) -> Result<Value, String> {
     use std::os::unix::net::UnixStream;
 
-    let path = fastade_desktop_lib::mcp::socket_path()
-        .ok_or_else(|| "could not determine the fastade app's data directory".to_owned())?;
+    // A remote host reaches the desktop app through an ssh-forwarded socket
+    // whose path fastade puts in $FASTADE_SOCK when it opens the session.
+    let path = match std::env::var_os("FASTADE_SOCK").filter(|value| !value.is_empty()) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => fastade_desktop_lib::mcp::socket_path()
+            .ok_or_else(|| "could not determine the fastade app's data directory".to_owned())?,
+    };
     let mut stream = UnixStream::connect(&path)
         .map_err(|_| "the fastade desktop app is not running".to_owned())?;
     let mut payload = request.to_string();
@@ -164,17 +241,57 @@ fn send_to_app(_request: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
-    fn exposes_only_read_only_listing_tools() {
+    fn exposes_listing_and_record_tools_but_no_session_control() {
         let tools = tool_definitions();
         let tools = tools.as_array().expect("tool definitions must be an array");
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["name"], "list_sessions");
-        assert_eq!(tools[1]["name"], "list_projects");
+        let names: Vec<_> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "list_sessions",
+                "list_projects",
+                "list_records",
+                "create_record",
+                "update_record",
+                "delete_record"
+            ]
+        );
 
         let error = call_tool(json!({ "name": "send_message", "arguments": {} }))
             .expect_err("removed mutation tools must stay unavailable");
         assert_eq!(error["code"], -32602);
+    }
+
+    #[test]
+    fn record_requests_carry_the_op_and_ignore_a_spoofed_session() {
+        let request = record_request(
+            "create_record",
+            &json!({ "kind": "note", "title": "t", "session_id": "attacker" }),
+        );
+        assert_eq!(request["op"], "create_record");
+        assert_eq!(request["title"], "t");
+        assert_ne!(request["session_id"], "attacker");
+        assert_eq!(record_request("list_records", &Value::Null)["op"], "list_records");
+    }
+
+    #[test]
+    fn reads_effective_models_from_codex_and_claude_transcripts() {
+        let path = std::env::temp_dir().join(format!("fastade-model-{}.jsonl", std::process::id()));
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-old\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-new\"}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_effective_model(path.to_str().unwrap()).as_deref(),
+            Some("claude-new")
+        );
+        fs::remove_file(path).unwrap();
     }
 }

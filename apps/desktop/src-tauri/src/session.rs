@@ -97,9 +97,36 @@ pub struct SessionSummary {
     pub title: String,
     pub cli: Option<CliKind>,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_agent: Option<AgentModelInfo>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub last_models: HashMap<String, AgentModelInfo>,
     pub endpoint: String,
     pub project_path: String,
     pub status: SessionStatus,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelInfo {
+    pub cli: CliKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    pub detected_at: String,
+    pub source: AgentModelSource,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentModelSource {
+    LaunchArg,
+    SessionLog,
+    Config,
+    Unknown,
 }
 
 /// Read-only session snapshot exposed by fastade MCP. Terminal transcripts
@@ -114,6 +141,8 @@ pub(crate) struct McpSessionSummary {
     title: String,
     cli: Option<CliKind>,
     model: Option<String>,
+    current_agent: Option<AgentModelInfo>,
+    last_models: HashMap<String, AgentModelInfo>,
     endpoint: String,
     project_path: String,
     status: McpSessionStatus,
@@ -141,7 +170,7 @@ impl From<SessionStatus> for McpSessionStatus {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CliKind {
     Codex,
@@ -186,6 +215,22 @@ pub fn list_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<SessionSum
 /// working directory for helper CLI invocations (like usage lookups) so they
 /// launch somewhere the user has very likely already used Claude Code and
 /// trusted, instead of an unpredictable inherited directory.
+/// SSH endpoints that have a live session, each once, for per-host checks.
+pub fn running_remote_endpoints(state: &AppState) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    if let Ok(sessions) = state.sessions.lock() {
+        for session in sessions.iter() {
+            if session.endpoint != "local"
+                && matches!(session.status, SessionStatus::Running)
+                && !endpoints.contains(&session.endpoint)
+            {
+                endpoints.push(session.endpoint.clone());
+            }
+        }
+    }
+    endpoints
+}
+
 pub fn most_recent_local_path(state: &AppState) -> Option<String> {
     state
         .sessions
@@ -208,6 +253,8 @@ pub fn create_session(
         title: input.title,
         cli: None,
         model: None,
+        current_agent: None,
+        last_models: HashMap::new(),
         endpoint: input.endpoint,
         project_path: input.project_path,
         status: SessionStatus::Running,
@@ -350,12 +397,96 @@ pub fn update_session_agent(
             .iter_mut()
             .find(|session| session.id == session_id)
             .ok_or_else(|| "session not found".to_owned())?;
-        session.cli = cli;
-        session.model = model.filter(|value| !value.trim().is_empty());
+        apply_session_agent(session, cli, model);
         session.clone()
     };
     persist_sessions(&state)?;
     Ok(updated)
+}
+
+fn apply_session_agent(session: &mut SessionSummary, cli: Option<CliKind>, model: Option<String>) {
+    let requested_model = model.filter(|value| !value.trim().is_empty());
+    if let Some(cli) = cli {
+        let info = AgentModelInfo {
+            cli,
+            requested_model: requested_model.clone(),
+            effective_model: None,
+            provider_session_id: None,
+            detected_at: chrono::Utc::now().to_rfc3339(),
+            source: if requested_model.is_some() {
+                AgentModelSource::LaunchArg
+            } else {
+                AgentModelSource::Unknown
+            },
+        };
+        session
+            .last_models
+            .insert(cli_key(cli).to_owned(), info.clone());
+        session.current_agent = Some(info);
+        session.cli = Some(cli);
+        session.model = requested_model;
+    } else {
+        if let Some(info) = session.current_agent.take() {
+            session
+                .last_models
+                .insert(cli_key(info.cli).to_owned(), info);
+        }
+        session.cli = None;
+        session.model = None;
+    }
+}
+
+fn cli_key(cli: CliKind) -> &'static str {
+    match cli {
+        CliKind::Codex => "codex",
+        CliKind::Claude => "claude",
+        CliKind::Gemini => "gemini",
+    }
+}
+
+/// Applies metadata reported by the running CLI's lifecycle hook. The
+/// FASTADE_SESSION_ID inherited from the PTY makes this association exact,
+/// unlike guessing from cwd when several agents use the same project.
+pub(crate) fn set_agent_metadata(
+    session_id: &str,
+    provider_session_id: Option<String>,
+    effective_model: Option<String>,
+    state: &AppState,
+) -> Result<(), String> {
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "session store is unavailable".to_owned())?;
+    let session = sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "session not found".to_owned())?;
+    apply_agent_metadata(session, provider_session_id, effective_model);
+    drop(sessions);
+    persist_sessions(state)
+}
+
+fn apply_agent_metadata(
+    session: &mut SessionSummary,
+    provider_session_id: Option<String>,
+    effective_model: Option<String>,
+) {
+    let Some(mut info) = session.current_agent.clone() else {
+        return;
+    };
+    if let Some(value) = provider_session_id.filter(|value| !value.trim().is_empty()) {
+        info.provider_session_id = Some(value);
+    }
+    if let Some(value) = effective_model.filter(|value| !value.trim().is_empty()) {
+        info.effective_model = Some(value.clone());
+        session.model = Some(value);
+        info.source = AgentModelSource::SessionLog;
+    }
+    info.detected_at = chrono::Utc::now().to_rfc3339();
+    session
+        .last_models
+        .insert(cli_key(info.cli).to_owned(), info.clone());
+    session.current_agent = Some(info);
 }
 
 #[tauri::command]
@@ -487,7 +618,20 @@ fn spawn_terminal(
             },
             password,
         });
-    let (command, autofill_password) = build_command(session, managed_connection.as_ref())?;
+    // A remote host gets access to the desktop MCP socket only for signed-in
+    // users. No account token is sent over SSH: the remote bridge talks over
+    // this per-session socket and the desktop app keeps credentials in the OS
+    // keychain.
+    let remote_mcp_enabled = remote_mcp_enabled(&session.endpoint, crate::auth::is_signed_in());
+    let forward_socket = remote_mcp_enabled
+        .then(crate::mcp::socket_path)
+        .flatten()
+        .filter(|path| path.exists());
+    let (command, autofill_password) =
+        build_command(session, managed_connection.as_ref(), forward_socket.as_deref())?;
+    if remote_mcp_enabled && forward_socket.is_some() {
+        crate::remote_mcp::ensure_installed_in_background(&app, &session.endpoint);
+    }
     let mut child = pair
         .slave
         .spawn_command(command)
@@ -605,6 +749,7 @@ struct ManagedConnection {
 fn build_command(
     session: &SessionSummary,
     managed: Option<&ManagedConnection>,
+    forward_socket: Option<&Path>,
 ) -> Result<(CommandBuilder, Option<String>), String> {
     if session.endpoint == "local" {
         let mut command = CommandBuilder::new(local_shell());
@@ -630,6 +775,19 @@ fn build_command(
         "-o",
         "TCPKeepAlive=yes",
     ]);
+    // Hand the remote shell this app's MCP socket, so an AI CLI running there
+    // can reach the same notes/tasks/activity as a local one without any
+    // credential ever being stored on the remote host.
+    let remote_socket = forward_socket.map(|local| {
+        let remote = crate::remote_mcp::remote_socket_path(&session.id);
+        command.args([
+            "-o",
+            "StreamLocalBindUnlink=yes",
+            "-R",
+            &format!("{remote}:{}", local.to_string_lossy()),
+        ]);
+        remote
+    });
     let password = if let Some(server) = managed {
         command.args(["-p", &server.port.to_string()]);
         if let Some(path) = &server.key_path {
@@ -641,13 +799,24 @@ fn build_command(
         command.arg(&session.endpoint);
         None
     };
-    if session.project_path != "~" {
+    let enter = (session.project_path != "~")
+        .then(|| format!("cd -- {} && ", shell_quote(&session.project_path)))
+        .unwrap_or_default();
+    if let Some(remote) = remote_socket {
+        // `env` rather than `export`, which not every login shell has.
         command.arg(format!(
-            "cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -l",
-            shell_quote(&session.project_path)
+            "{enter}exec env FASTADE_SESSION_ID={} FASTADE_SOCK={} \"${{SHELL:-/bin/sh}}\" -l",
+            shell_quote(&session.id),
+            shell_quote(&remote)
         ));
+    } else if session.project_path != "~" {
+        command.arg(format!("{enter}exec \"${{SHELL:-/bin/sh}}\" -l"));
     }
     Ok((command, password))
+}
+
+fn remote_mcp_enabled(endpoint: &str, signed_in: bool) -> bool {
+    endpoint != "local" && signed_in
 }
 
 fn local_shell() -> String {
@@ -689,7 +858,7 @@ fn get_terminal(
         .ok_or_else(|| "terminal is not running".to_owned())
 }
 
-fn find_session(
+pub(crate) fn find_session(
     session_id: &str,
     state: &tauri::State<'_, AppState>,
 ) -> Result<SessionSummary, String> {
@@ -931,6 +1100,19 @@ pub(crate) fn mcp_sessions(
     Ok(merge_mcp_sessions(profiles, sessions, &memory, &activity))
 }
 
+/// The saved session a running fastade session belongs to, so an MCP caller
+/// that only knows `$FASTADE_SESSION_ID` can still attach a note to it.
+pub(crate) fn mcp_profile_for_session(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    Ok(mcp_sessions(app, state)?
+        .into_iter()
+        .find(|session| session.session_id.as_deref() == Some(session_id))
+        .and_then(|session| session.profile_id))
+}
+
 fn merge_mcp_sessions(
     profiles: Vec<crate::saved_sessions::SavedSession>,
     mut sessions: Vec<SessionSummary>,
@@ -965,6 +1147,8 @@ fn merge_mcp_sessions(
                 title: profile.name,
                 cli: None,
                 model: None,
+                current_agent: None,
+                last_models: HashMap::new(),
                 endpoint: profile.last_endpoint,
                 project_path,
                 status: McpSessionStatus::Disconnected,
@@ -1004,6 +1188,8 @@ fn mcp_summary(
         title: session.title,
         cli: session.cli,
         model: session.model,
+        current_agent: session.current_agent,
+        last_models: session.last_models,
         endpoint: session.endpoint,
         project_path: session.project_path,
         status: session.status.into(),
@@ -1132,7 +1318,8 @@ pub(crate) fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_command, merge_mcp_sessions, resolve_program, shell_quote, ManagedConnection,
+        apply_agent_metadata, apply_session_agent, build_command, merge_mcp_sessions,
+        remote_mcp_enabled, resolve_program, shell_quote, AgentModelSource, ManagedConnection,
         SessionStatus, SessionSummary, Utf8StreamDecoder,
     };
     use crate::saved_sessions::SavedSession;
@@ -1144,6 +1331,8 @@ mod tests {
             title: "test".to_owned(),
             cli: None,
             model: None,
+            current_agent: None,
+            last_models: HashMap::new(),
             endpoint: endpoint.to_owned(),
             project_path: project_path.to_owned(),
             status: SessionStatus::Running,
@@ -1155,7 +1344,7 @@ mod tests {
     }
 
     fn managed_argv(session: &SessionSummary, managed: Option<&ManagedConnection>) -> Vec<String> {
-        build_command(session, managed)
+        build_command(session, managed, None)
             .unwrap()
             .0
             .get_argv()
@@ -1190,6 +1379,8 @@ mod tests {
             title: "active project".to_owned(),
             cli: None,
             model: None,
+            current_agent: None,
+            last_models: HashMap::new(),
             endpoint: "local".to_owned(),
             project_path: "/active".to_owned(),
             status: SessionStatus::Running,
@@ -1254,6 +1445,43 @@ mod tests {
     }
 
     #[test]
+    fn remote_session_forwards_the_app_socket_and_exports_its_identity() {
+        let remote_session = session("kowanas.dev", "/root/my app");
+        let (command, _) =
+            build_command(&remote_session, None, Some(std::path::Path::new("/Users/u/Library/App Support/fastade.sock")))
+                .unwrap();
+        let argv: Vec<_> = command
+            .get_argv()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        let forward = argv.iter().position(|arg| arg == "-R").unwrap();
+        assert_eq!(
+            argv[forward + 1],
+            format!(
+                "/tmp/fastade-{}.sock:/Users/u/Library/App Support/fastade.sock",
+                remote_session.id
+            )
+        );
+        assert!(argv.contains(&"StreamLocalBindUnlink=yes".to_owned()));
+        let remote = argv.last().unwrap();
+        assert!(remote.starts_with("cd -- '/root/my app' && exec env FASTADE_SESSION_ID="));
+        assert!(remote.contains(&format!("FASTADE_SOCK='/tmp/fastade-{}.sock'", remote_session.id)));
+        assert!(remote.ends_with("\"${SHELL:-/bin/sh}\" -l"));
+
+        // Even a bare home session needs the environment to reach the bridge.
+        let (home, _) = build_command(&session("kowanas.dev", "~"), None, Some(std::path::Path::new("/s"))).unwrap();
+        assert!(home.get_argv().last().unwrap().to_string_lossy().starts_with("exec env FASTADE_SESSION_ID="));
+    }
+
+    #[test]
+    fn remote_mcp_requires_a_signed_in_remote_session() {
+        assert!(remote_mcp_enabled("kowanas.dev", true));
+        assert!(!remote_mcp_enabled("kowanas.dev", false));
+        assert!(!remote_mcp_enabled("local", true));
+    }
+
+    #[test]
     fn managed_server_connects_with_port_and_key() {
         let connection = ManagedConnection {
             host: "1.2.3.4".to_owned(),
@@ -1263,7 +1491,7 @@ mod tests {
             password: None,
         };
         let (command, password) =
-            build_command(&session("managed:abc", "~"), Some(&connection)).unwrap();
+            build_command(&session("managed:abc", "~"), Some(&connection), None).unwrap();
         let argv: Vec<_> = command
             .get_argv()
             .iter()
@@ -1299,7 +1527,7 @@ mod tests {
             key_path: None,
             password: Some("hunter2".to_owned()),
         };
-        let (_, password) = build_command(&session("managed:abc", "~"), Some(&connection)).unwrap();
+        let (_, password) = build_command(&session("managed:abc", "~"), Some(&connection), None).unwrap();
         assert_eq!(password.as_deref(), Some("hunter2"));
     }
 
@@ -1320,5 +1548,52 @@ mod tests {
         }
         decoded.push_str(&decoder.finish());
         assert_eq!(decoded, "한글 출력");
+    }
+
+    #[test]
+    fn legacy_sessions_deserialize_without_model_metadata() {
+        let legacy = r#"{"id":"old","title":"old","endpoint":"local","projectPath":"/tmp","status":"completed"}"#;
+        let session: SessionSummary = serde_json::from_str(legacy).unwrap();
+        assert!(session.current_agent.is_none());
+        assert!(session.last_models.is_empty());
+    }
+
+    #[test]
+    fn last_model_survives_after_the_current_agent_exits() {
+        let mut value = session("local", "/tmp");
+        apply_session_agent(
+            &mut value,
+            Some(crate::session::CliKind::Codex),
+            Some("gpt-test".to_owned()),
+        );
+        assert_eq!(value.model.as_deref(), Some("gpt-test"));
+        apply_session_agent(&mut value, None, None);
+        assert!(value.current_agent.is_none());
+        assert!(value.cli.is_none());
+        assert_eq!(
+            value.last_models["codex"].requested_model.as_deref(),
+            Some("gpt-test")
+        );
+    }
+
+    #[test]
+    fn effective_model_and_provider_session_replace_only_runtime_fields() {
+        let mut value = session("local", "/tmp");
+        apply_session_agent(
+            &mut value,
+            Some(crate::session::CliKind::Claude),
+            Some("sonnet".to_owned()),
+        );
+        apply_agent_metadata(
+            &mut value,
+            Some("provider-123".to_owned()),
+            Some("claude-sonnet-exact".to_owned()),
+        );
+        let info = value.current_agent.as_ref().unwrap();
+        assert_eq!(info.requested_model.as_deref(), Some("sonnet"));
+        assert_eq!(info.effective_model.as_deref(), Some("claude-sonnet-exact"));
+        assert_eq!(info.provider_session_id.as_deref(), Some("provider-123"));
+        assert!(matches!(info.source, AgentModelSource::SessionLog));
+        assert_eq!(value.model.as_deref(), Some("claude-sonnet-exact"));
     }
 }

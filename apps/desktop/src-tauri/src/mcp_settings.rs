@@ -30,6 +30,50 @@ pub fn mcp_binary_path() -> Result<PathBuf, String> {
     ))
 }
 
+/// Agents whose fastade MCP integration is switched on on this machine. A
+/// remote host is set up for exactly these.
+pub(crate) fn enabled_agents() -> Vec<CliKind> {
+    [CliKind::Claude, CliKind::Codex, CliKind::Gemini]
+        .into_iter()
+        .filter(|cli| mcp_agent_enabled(*cli).unwrap_or(false))
+        .collect()
+}
+
+fn mcp_agent_enabled(cli: CliKind) -> Result<bool, String> {
+    match cli {
+        CliKind::Claude => json_has_fastade(&claude_json_path()?),
+        CliKind::Gemini => json_has_fastade(&gemini_json_path()?),
+        CliKind::Codex => codex_has_fastade(),
+    }
+}
+
+/// The config files `configure_under` edits, relative to the home directory.
+pub(crate) fn config_files(cli: CliKind) -> &'static [&'static str] {
+    match cli {
+        CliKind::Claude => &[".claude.json", ".claude/settings.json"],
+        CliKind::Gemini => &[".gemini/settings.json"],
+        CliKind::Codex => &[".codex/config.toml", ".codex/hooks.json"],
+    }
+}
+
+/// Registers `binary` for one CLI under an arbitrary root laid out like a home
+/// directory. A remote host's files are fetched into such a root, edited with
+/// the very same code that edits the local ones, and sent back.
+pub(crate) fn configure_under(root: &Path, cli: CliKind, binary: &Path) -> Result<(), String> {
+    match cli {
+        CliKind::Claude => {
+            set_json_entry(&root.join(".claude.json"), true, binary)?;
+            set_claude_hooks_at(&root.join(".claude/settings.json"), true, binary)
+        }
+        CliKind::Gemini => set_json_entry(&root.join(".gemini/settings.json"), true, binary),
+        CliKind::Codex => {
+            set_codex_toml_at(&root.join(".codex/config.toml"), true, binary)?;
+            set_codex_hooks_at(&root.join(".codex/hooks.json"), true, binary)?;
+            set_codex_notify_at(&root.join(".codex/config.toml"), true, binary)
+        }
+    }
+}
+
 #[tauri::command]
 pub fn mcp_agent_status(cli: CliKind) -> Result<bool, String> {
     let enabled = match cli {
@@ -307,6 +351,11 @@ fn set_codex_toml_at(path: &Path, enabled: bool, binary: &Path) -> Result<(), St
         let mut table = toml_edit::Table::new();
         table["command"] = toml_edit::value(binary.to_string_lossy().into_owned());
         table["args"] = toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new()));
+        // Codex starts MCP servers with a trimmed environment; without this the
+        // SSH bridge never sees the forwarded socket and reports "failed".
+        table["env_vars"] = toml_edit::Item::Value(toml_edit::Value::Array(
+            ["FASTADE_SOCK", "FASTADE_SESSION_ID"].into_iter().collect(),
+        ));
         doc["mcp_servers"]["fastade"] = toml_edit::Item::Table(table);
     } else if let Some(servers) = doc
         .get_mut("mcp_servers")
@@ -443,6 +492,13 @@ mod tests {
             doc["mcp_servers"]["fastade"]["command"].as_str().unwrap(),
             "/usr/local/bin/fastade_mcp"
         );
+        let env_vars: Vec<_> = doc["mcp_servers"]["fastade"]["env_vars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(env_vars, ["FASTADE_SOCK", "FASTADE_SESSION_ID"]);
 
         set_codex_toml_at(&path, false, Path::new("/usr/local/bin/fastade_mcp")).unwrap();
         let contents = fs::read_to_string(&path).unwrap();

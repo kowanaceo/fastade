@@ -133,7 +133,7 @@ Desktop: Svelte View -> TypeScript ViewModel -> Tauri/Local IPC Client -> Rust H
 | `ManagedServer` | id, name, host, port, username, auth(`password`\|`key_file`) | 앱 안에서 직접 등록한 원격 server. password는 OS keychain에만 저장하고 JSON 프로필에는 두지 않는다. key 인증은 기존 key file 경로 또는 앱이 생성한 ed25519 keypair 경로를 갖는다. |
 | `Project` | id, display_name, canonical_path, trust_level, server_id | 사용자가 반복 작업하는 중심 단위 = server + folder. pin이 곧 Project 등록이다. CLI/model은 여기 저장하지 않는다. |
 | `CliInstallation` | id, adapter_id, executable_path, version, status | 탐지된 CLI 설치본. Project는 탐지된 CLI 중 어떤 것이든 선택 가능한 목록으로 노출한다. |
-| `Session` | id, project_id, server_id, working_directory, running_adapter_id, running_model, state, created_at, resume_token | server 위의 login shell 하나. `running_adapter_id`/`running_model`은 지금 그 shell 안에서 도는 AI CLI(없으면 null)로, 헤더의 agent 선택으로 실행하고 ■ 로 종료하면 shell로 돌아온다. 세션 이름은 폴더 버튼으로 folder를 바꿀 때 그 폴더 이름으로 바뀐다. |
+| `Session` | id, project_id, server_id, working_directory, running_adapter_id, running_model, current_agent, last_models, state, created_at, resume_token | server 위의 login shell 하나. `running_adapter_id`/`running_model`은 지금 그 shell 안에서 도는 AI CLI(없으면 null)이고, `current_agent`는 requested/effective model과 provider session ID 및 탐지 출처를 담는다. `last_models`는 agent별 마지막 값을 종료 후에도 보존한다. 헤더의 agent 선택으로 실행하고 ■ 로 종료하면 shell로 돌아온다. 세션 이름은 폴더 버튼으로 folder를 바꿀 때 그 폴더 이름으로 바뀐다. |
 | `Event` | id, session_id, seq, type, payload, raw_ref, created_at | 순서가 보장된 타임라인 항목 |
 | `Approval` | id, session_id, kind, details, state, expires_at | 사용자 결정이 필요한 요청 |
 | `Artifact` | id, session_id, kind, path, metadata | diff, 이미지, 보고서 등 산출물 |
@@ -254,7 +254,7 @@ trait CliAdapter {
 - 온보딩: CLI 탐지, 프로젝트 등록, 보안 안내
 - 홈: 프로젝트, 최근 세션, 실행 중 작업
 - 새 세션: 버튼 두 개뿐이다. **Local**은 곧바로 이 컴퓨터의 `~`에서 `$SHELL -l` login shell을 연다. **Remote**는 server picker를 연다 — 왼쪽은 `~/.ssh/config`에서 읽은 Host 목록, 오른쪽은 앱에 등록한 server 목록이다. 오른쪽 `+`로 새 server를 등록한다: name, domain/IP, port, username, 인증(password 또는 key file). password는 OS keychain에만 저장하고(JSON 프로필에는 없음) `ssh` PTY에 password 프롬프트가 뜨는 순간 한 번 자동 입력한다. key file은 기존 파일을 고르거나 그 자리에서 ed25519 keypair를 새로 생성할 수 있으며, 생성 직후에만 공개키를 복사할 수 있는 1회성 패널을 보여준다(원격의 `authorized_keys`에 붙여넣는 용도). 어느 쪽을 고르든 그 server의 `~`에서 `ssh -tt`로 login shell이 열린다. CLI/model/path는 여기서 묻지 않는다.
-- 세션 헤더: `⌂ path` 버튼(항상 표시; local은 OS 폴더 선택창, SSH는 원격 폴더 탐색기 → 고른 folder로 shell을 `cd`시키고 세션 이름을 그 폴더 이름으로 변경), 상태 오른쪽의 **AI 실행 선택**(Codex/Claude Code/Gemini — 설정의 CLI별 기본 model을 `--model`로 붙여 shell에 입력), ■(실행 중인 agent를 종료하고 shell로 복귀). agent 실행 중에는 folder 변경이 막힌다.
+- 세션 헤더: `⌂ path` 버튼(항상 표시; local은 OS 폴더 선택창, SSH는 원격 폴더 탐색기 → 고른 folder로 shell을 `cd`시키고 세션 이름을 그 폴더 이름으로 변경), 상태 오른쪽의 **AI 실행 선택**(Codex/Claude Code/Gemini — 설정의 CLI별 기본 model을 `--model`로 붙여 shell에 입력), ■(실행 중인 agent를 종료하고 shell로 복귀). agent 실행 중에는 folder 변경이 막힌다. 직접 입력한 `--model`/`-m`도 기록하며, lifecycle hook이 제공되면 provider transcript에서 실제 effective model과 provider session ID를 보강한다.
 - shell의 cwd는 접속 시 한 번 설치하는 prompt hook(bash `PROMPT_COMMAND` / zsh `precmd`)이 OSC 7로 보고한다. 새 프롬프트가 그려졌다는 것은 agent가 종료됐다는 뜻이기도 하다.
 - 세션: CLI-native xterm 터미널, 상태, 중지, 종료, 팝아웃
 - 설정: CLI 설치, pin된 프로젝트, 정책, server(SSH) 목록, 데이터 관리

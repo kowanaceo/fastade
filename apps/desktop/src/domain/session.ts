@@ -1,6 +1,23 @@
 export type CliKind = 'codex' | 'gemini' | 'claude';
 export type SessionStatus = 'running' | 'completed' | 'failed';
 
+export type AgentModelSource = 'launch-arg' | 'session-log' | 'config' | 'unknown';
+
+export interface AgentModelInfo {
+  cli: CliKind;
+  requestedModel?: string;
+  effectiveModel?: string;
+  providerSessionId?: string;
+  detectedAt: string;
+  source: AgentModelSource;
+}
+
+export interface AgentModelOption {
+  id: string;
+  label: string;
+  source: 'cache' | 'alias';
+}
+
 export interface CliSessionSummary {
   kind?: 'cli';
   id: string;
@@ -8,6 +25,10 @@ export interface CliSessionSummary {
   /** Agent currently running inside the session's shell, if any. */
   cli?: CliKind;
   model?: string;
+  /** Rich metadata for the agent currently running in this shell. */
+  currentAgent?: AgentModelInfo;
+  /** Last known model metadata for each CLI, retained after it exits. */
+  lastModels?: Partial<Record<CliKind, AgentModelInfo>>;
   endpoint: string;
   projectPath: string;
   status: SessionStatus;
@@ -88,6 +109,24 @@ export interface AgentUsage {
   message?: string;
 }
 
+/** One host's limits at `collectedAt` (epoch seconds), as the account stores
+ * them for other devices to show. */
+export interface AgentAccount {
+  agentId: string;
+  accountId: string;
+  label?: string;
+}
+
+export interface UsageSnapshot {
+  agentId: string;
+  hostId: string;
+  hostLabel: string;
+  /** Provider account the limits belong to; hosts on one account share them. */
+  accountId?: string;
+  collectedAt: number;
+  windows: UsageWindow[];
+}
+
 export interface AuthUser {
   id: string;
   name: string;
@@ -101,7 +140,7 @@ export interface AuthStatus {
   deviceId?: string;
 }
 
-export type SyncEntityType = 'profile' | 'group' | 'pin' | 'setting' | 'device_path';
+export type SyncEntityType = 'profile' | 'group' | 'pin' | 'setting' | 'device_path' | 'session_record';
 
 export interface SyncEntity {
   entityType: SyncEntityType;

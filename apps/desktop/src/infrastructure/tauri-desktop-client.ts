@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { CreateSessionInput, DesktopClient, RemoteDirectoryListing, SaveSessionInput, SshHost, TerminalEvent } from '../application/desktop-client';
-import type { AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput } from '../domain/session';
+import type { AgentAccount, AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
 
 export class TauriDesktopClient implements DesktopClient {
   listSessions(): Promise<CliSessionSummary[]> {
@@ -71,12 +71,22 @@ export class TauriDesktopClient implements DesktopClient {
     return typeof selected === 'string' ? selected : null;
   }
 
+  async selectFiles(defaultPath?: string): Promise<string[]> {
+    const selected = await open({ directory: false, multiple: true, defaultPath });
+    if (Array.isArray(selected)) return selected;
+    return typeof selected === 'string' ? [selected] : [];
+  }
+
   uploadFileToSession(sessionId: string, sourcePath: string): Promise<string> {
     return invoke<string>('upload_file_to_session', { sessionId, sourcePath });
   }
 
   async subscribeToTerminal(handler: (event: TerminalEvent) => void): Promise<() => void> {
     return listen<TerminalEvent>('terminal-event', (event) => handler(event.payload));
+  }
+
+  async subscribeToRecordChanges(handler: () => void): Promise<() => void> {
+    return listen('records-changed', () => handler());
   }
 
   createSession(input: CreateSessionInput): Promise<CliSessionSummary> {
@@ -103,6 +113,14 @@ export class TauriDesktopClient implements DesktopClient {
     return invoke<CliSessionSummary>('update_session_agent', { sessionId, cli: cli ?? null, model: model ?? null });
   }
 
+  refreshSessionAgentMetadata(sessionId: string): Promise<CliSessionSummary> {
+    return invoke<CliSessionSummary>('refresh_session_agent_metadata', { sessionId });
+  }
+
+  listAgentModels(endpoint: string, cli: CliKind): Promise<AgentModelOption[]> {
+    return invoke<AgentModelOption[]>('list_agent_models', { endpoint, cli });
+  }
+
   interruptSession(sessionId: string): Promise<CliSessionSummary> {
     return invoke<CliSessionSummary>('interrupt_session', { sessionId });
   }
@@ -119,8 +137,24 @@ export class TauriDesktopClient implements DesktopClient {
     return invoke<void>('open_session_window', { sessionId });
   }
 
-  getAgentUsage(agentId: string): Promise<AgentUsage> {
-    return invoke<AgentUsage>('get_agent_usage', { agentId });
+  getAgentUsage(agentId: string, force = false): Promise<AgentUsage> {
+    return invoke<AgentUsage>('get_agent_usage', { agentId, force });
+  }
+
+  getLocalAccounts(): Promise<AgentAccount[]> {
+    return invoke<AgentAccount[]>('get_local_accounts');
+  }
+
+  getRemoteUsage(force = false): Promise<UsageSnapshot[]> {
+    return invoke<UsageSnapshot[]>('get_remote_usage', { force });
+  }
+
+  putUsageSnapshot(snapshot: UsageSnapshot): Promise<void> {
+    return invoke<void>('put_usage_snapshot', { snapshot });
+  }
+
+  listUsageSnapshots(): Promise<unknown> {
+    return invoke<unknown>('list_usage_snapshots');
   }
 
   sessionMemoryUsage(): Promise<Record<string, number>> {

@@ -1,4 +1,4 @@
-import type { AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput } from '../domain/session';
+import type { AgentAccount, AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
 
 export interface CreateSessionInput {
   title: string;
@@ -44,19 +44,31 @@ export interface DesktopClient {
   getHomeDirectory(): Promise<string | null>;
   selectFolder(defaultPath?: string): Promise<string | null>;
   selectFile(defaultPath?: string): Promise<string | null>;
+  selectFiles(defaultPath?: string): Promise<string[]>;
   uploadFileToSession(sessionId: string, sourcePath: string): Promise<string>;
   subscribeToTerminal(handler: (event: TerminalEvent) => void): Promise<() => void>;
+  /** Notes or tasks changed outside the window, e.g. through the MCP bridge. */
+  subscribeToRecordChanges(handler: () => void): Promise<() => void>;
   createSession(input: CreateSessionInput): Promise<CliSessionSummary>;
   writeTerminal(sessionId: string, data: string): Promise<void>;
   resizeTerminal(sessionId: string, cols: number, rows: number): Promise<void>;
   terminalSnapshot(sessionId: string): Promise<string>;
   updateSessionContext(sessionId: string, title: string, projectPath: string): Promise<CliSessionSummary>;
   updateSessionAgent(sessionId: string, cli?: CliKind, model?: string): Promise<CliSessionSummary>;
+  refreshSessionAgentMetadata(sessionId: string): Promise<CliSessionSummary>;
+  listAgentModels(endpoint: string, cli: CliKind): Promise<AgentModelOption[]>;
   interruptSession(sessionId: string): Promise<CliSessionSummary>;
   reconnectSession(sessionId: string): Promise<CliSessionSummary>;
   closeSession(sessionId: string): Promise<void>;
   openSessionWindow(sessionId: string): Promise<void>;
-  getAgentUsage(agentId: string): Promise<AgentUsage>;
+  /** `force` skips the short-lived cache of Claude's slow-to-read limits. */
+  getAgentUsage(agentId: string, force?: boolean): Promise<AgentUsage>;
+  /** Codex limits of every SSH host with a live session. `force` asks the host
+   * for live limits instead of relying only on its latest session log. */
+  getRemoteUsage(force?: boolean): Promise<UsageSnapshot[]>;
+  getLocalAccounts(): Promise<AgentAccount[]>;
+  putUsageSnapshot(snapshot: UsageSnapshot): Promise<void>;
+  listUsageSnapshots(): Promise<unknown>;
   sessionMemoryUsage(): Promise<Record<string, number>>;
   sessionActivityOverrides(): Promise<Record<string, string>>;
   clearSessionActivityOverride(sessionId: string): Promise<void>;
