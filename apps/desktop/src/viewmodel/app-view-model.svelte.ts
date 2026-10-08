@@ -8,6 +8,9 @@ import { detectAgentLaunch } from './agent-command';
 
 type TerminalSink = (data: string, replay?: boolean) => void;
 
+export const MAX_GROUP_SESSIONS = 8;
+const groupFullMessage = `A group can hold up to ${MAX_GROUP_SESSIONS} sessions. Close one or use another group.`;
+
 export interface SessionGroup {
   id: string;
   name: string;
@@ -666,6 +669,10 @@ export class AppViewModel {
       this.error = 'Choose a server.';
       return;
     }
+    if (this.groupIsFull(targetGroupId)) {
+      this.error = groupFullMessage;
+      return;
+    }
     const path = projectPath ?? this.homePathFor(server);
     this.error = null;
     try {
@@ -765,6 +772,10 @@ export class AppViewModel {
       }
       const session = this.sessions.find((item) => item.id === entryId);
       if (!session) return;
+      if (this.groupForSession(session.id) !== validGroupId && this.groupIsFull(validGroupId)) {
+        this.error = groupFullMessage;
+        return;
+      }
       // A saved profile can be shared by several running sessions. Snapshot
       // each session's current group before moving the profile so dragging one
       // row does not make every session for the same project jump with it.
@@ -1036,10 +1047,25 @@ export class AppViewModel {
     }
   }
 
+  private pendingResizes = new Map<string, { cols: number; rows: number }>();
+  private resizeInFlight = new Set<string>();
+
   async resizeTerminal(sessionId: string, cols: number, rows: number): Promise<void> {
     if (this.sessions.find((session) => session.id === sessionId)?.status !== 'running') return;
-    try { await this.client.resizeTerminal(sessionId, cols, rows); }
-    catch (error) { this.error = this.message(error); }
+    // Keep resizes ordered per session and let only the newest one through, so
+    // a late shrink can never overwrite the final grown size.
+    this.pendingResizes.set(sessionId, { cols, rows });
+    if (this.resizeInFlight.has(sessionId)) return;
+    this.resizeInFlight.add(sessionId);
+    try {
+      for (let next = this.pendingResizes.get(sessionId); next; next = this.pendingResizes.get(sessionId)) {
+        this.pendingResizes.delete(sessionId);
+        try { await this.client.resizeTerminal(sessionId, next.cols, next.rows); }
+        catch (error) { this.error = this.message(error); }
+      }
+    } finally {
+      this.resizeInFlight.delete(sessionId);
+    }
   }
 
   async interruptSession(sessionId = this.selectedSessionId): Promise<void> {
@@ -1265,6 +1291,13 @@ export class AppViewModel {
     const session = this.sessions.find((item) => item.id === sessionId);
     const profile = session ? this.profileForSession(session) : undefined;
     return this.validCustomGroupId(profile ? this.profileGroupIds[profile.id] : undefined) ?? UNGROUPED_ID;
+  }
+
+  /** A group shows at most MAX_GROUP_SESSIONS live terminals; the split grid
+   * layout is only designed for that many. */
+  private groupIsFull(groupId: string): boolean {
+    const group = this.sessionGroups.find((item) => item.id === groupId);
+    return (group?.sessions.filter((session) => session.status !== 'completed').length ?? 0) >= MAX_GROUP_SESSIONS;
   }
 
   private validCustomGroupId(groupId: string | undefined): string | undefined {
