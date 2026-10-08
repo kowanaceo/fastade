@@ -220,6 +220,14 @@
       // Native fullscreen transitions can finish well after ResizeObserver's
       // last callback. Re-fit through the end of that transition.
       fitTimers = [120, 350, 700].map((delay) => setTimeout(fitAndRefresh, delay));
+      // Once resizing has settled, re-send the geometry even if it matches the
+      // last one we sent. If an intermediate resize (e.g. while the window was
+      // shrunk) was dropped or applied out of order, the PTY would otherwise
+      // keep the stale narrow size and the TUI keeps drawing at that width.
+      fitTimers.push(setTimeout(() => {
+        lastSyncedSize = '';
+        fitAndRefresh();
+      }, 1200));
     };
     scheduleFitRef = scheduleFit;
     const observer = new ResizeObserver(scheduleFit);

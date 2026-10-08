@@ -61,6 +61,7 @@
       ? visibleSessions
       : viewModel.sessions.filter((session) => session.status !== 'completed'),
   );
+  const splitLayout = $derived(!poppedSessionId && visibleSessions.length >= 5 && visibleSessions.length <= 8);
   let sessionMenu = $state<{ sessionId: string; x: number; y: number } | null>(null);
   let groupMenu = $state<{ groupId: string; groupName: string; x: number; y: number } | null>(null);
   let groupRename = $state<{ groupId: string; name: string } | null>(null);
@@ -107,7 +108,8 @@
 
   function formatReset(timestamp?: number): string {
     if (!timestamp) return '';
-    const milliseconds = Math.max(0, timestamp * 1000 - Date.now());
+    // Read clockNow (reactive) so the countdown re-renders as time passes.
+    const milliseconds = Math.max(0, timestamp * 1000 - clockNow.getTime());
     const hours = Math.floor(milliseconds / 3_600_000);
     const minutes = Math.floor((milliseconds % 3_600_000) / 60_000);
     return hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h` : `${hours}h ${minutes}m`;
@@ -203,6 +205,18 @@
 
   function isGroupCollapsed(groupId: string): boolean {
     return collapsedGroups[groupId] ?? true;
+  }
+
+  const connectedCount = $derived(viewModel.sessionGroups.reduce((sum, group) => sum + group.entries.filter((entry) => entry.status === 'running').length, 0));
+  const totalEntries = $derived(viewModel.sessionGroups.reduce((sum, group) => sum + group.entries.length, 0));
+  const connectedGroupIds = $derived(viewModel.sessionGroups.filter((group) => group.entries.some((entry) => entry.status === 'running')).map((group) => group.id));
+  const connectedExpanded = $derived(connectedGroupIds.length > 0 && connectedGroupIds.every((id) => !isGroupCollapsed(id)));
+
+  /** Expand every group that holds a connected session, or collapse them all
+   * again when they are already open. */
+  function toggleConnectedGroups(): void {
+    const collapse = connectedExpanded;
+    collapsedGroups = { ...collapsedGroups, ...Object.fromEntries(connectedGroupIds.map((id) => [id, collapse])) };
   }
 
   function handleGlobalContextMenu(event: MouseEvent): void {
@@ -379,11 +393,14 @@
         </section>
       {/if}
       <nav aria-label="Group list">
-        <p class="eyebrow">GROUPS · {viewModel.sessionGroups.length - 1}</p>
         <form class="new-group" onsubmit={(event) => { event.preventDefault(); viewModel.createGroup(); }}>
           <input bind:value={viewModel.draftGroupName} aria-label="New group name" placeholder="New group" />
           <button type="submit" aria-label="Add group" title="Add group">+</button>
         </form>
+        <div class="list-heading">
+          <p class="eyebrow">GROUPS · {viewModel.sessionGroups.length - 1}</p>
+          <button class="eyebrow sessions-toggle" disabled={!connectedGroupIds.length} aria-pressed={connectedExpanded} title={connectedExpanded ? 'Collapse groups with connected sessions' : 'Expand every group with connected sessions'} onclick={toggleConnectedGroups}>SESSIONS · {connectedCount}/{totalEntries}</button>
+        </div>
         {#each viewModel.sessionGroups as group (group.id)}
           {@const groupTasks = [...new Set(group.entries.flatMap((entry) => entry.profileId ?? []))].reduce((sum, id) => sum + (openTaskCounts[id] ?? 0), 0)}
           <section
@@ -494,6 +511,8 @@
         class:single={poppedSessionId}
         class:three={visibleSessions.length === 3 && !poppedSessionId}
         class:four={visibleSessions.length === 4 && !poppedSessionId}
+        class:split={splitLayout}
+        style={splitLayout ? `--split-top:${Math.ceil(visibleSessions.length / 2)};--split-bottom:${Math.floor(visibleSessions.length / 2)}` : undefined}
         class="session-grid"
         ondragover={handleActiveGroupDragOver}
         ondrop={handleActiveGroupDrop}
@@ -504,9 +523,9 @@
           {@const memoryLabel = viewModel.memoryLabelFor(session.id)}
           {@const recordProfile = viewModel.profileForSession(session)}
           {@const openTasks = recordProfile ? openTaskCounts[recordProfile.id] ?? 0 : 0}
-          <article data-session-id={session.id} hidden={!poppedSessionId && !visibleSessions.some((visible) => visible.id === session.id)} role="group" aria-label={`${session.title} terminal session`} class:active={session.id === viewModel.selectedSessionId} class:grid-left={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id === session.id} class:grid-right={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id !== session.id && visibleSessions.some((visible) => visible.id === session.id)} class="session-card" oncontextmenu={(event) => openSessionMenu(event, session.id)}>
+          <article data-session-id={session.id} hidden={!poppedSessionId && !visibleSessions.some((visible) => visible.id === session.id)} role="group" aria-label={`${session.title} terminal session`} class:active={session.id === viewModel.selectedSessionId} class:grid-left={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id === session.id} class:grid-right={visibleSessions.length === 3 && !poppedSessionId && visibleSessions.at(-1)?.id !== session.id && visibleSessions.some((visible) => visible.id === session.id)} class:split-top={splitLayout && visibleSessions.findIndex((visible) => visible.id === session.id) < Math.ceil(visibleSessions.length / 2)} class:split-bottom={splitLayout && visibleSessions.findIndex((visible) => visible.id === session.id) >= Math.ceil(visibleSessions.length / 2)} class="session-card" oncontextmenu={(event) => openSessionMenu(event, session.id)}>
             <header class="card-header">
-              <div class="session-identity"><span class="cli-badge">{session.cli ? session.cli.slice(0, 1).toUpperCase() : '$'}</span><strong title={session.title}>{session.title}</strong><span class="agent">{session.cli ? `${cliNames[session.cli]}${session.model ? ` · ${session.model}` : ''}` : 'shell'}</span>
+              <div class="session-identity"><span class="cli-badge" class:remote={session.endpoint !== 'local'} title={session.endpoint === 'local' ? 'Local' : `Remote · ${viewModel.endpointLabel(session.endpoint)}`}>{session.endpoint === 'local' ? 'L' : viewModel.endpointLabel(session.endpoint).slice(0, 1).toUpperCase()}</span><strong title={session.title}>{session.title}</strong><span class="agent">{session.cli ? `${cliNames[session.cli]}${session.model ? ` · ${session.model}` : ''}` : 'shell'}</span>
                 {#if session.cli}<span class="activity-chip" data-activity={activity} title={activityLabels[activity]}>{activity === 'working' ? 'Working' : activity === 'waiting' ? 'Needs you' : 'Ready'}</span>{/if}
                 {#if memoryLabel}<span class="memory-chip" title="Resident memory used by this session's shell and its child processes">{memoryLabel}</span>{/if}
                 <span title={session.endpoint}>⌁ {viewModel.endpointLabel(session.endpoint)}</span>
