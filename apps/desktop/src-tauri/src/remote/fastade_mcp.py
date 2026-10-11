@@ -20,6 +20,16 @@ import sys
 VERSION = "1"
 
 
+def alive(path):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(2)
+            probe.connect(path)
+        return True
+    except OSError:
+        return False
+
+
 def live_sockets():
     """Forwarded app sockets that still accept connections, newest first."""
     found = []
@@ -40,8 +50,10 @@ def session_socket():
     """$FASTADE_SOCK, or, for a CLI whose daemon started outside the session
     shell (codex app-server) and so never inherited it, the newest live socket."""
     path = os.environ.get("FASTADE_SOCK")
-    if path:
+    if path and alive(path):
         return path
+    # A stale $FASTADE_SOCK (the SSH forward was re-established under a new
+    # id, or the CLI outlived its session) must not wedge the bridge.
     sockets = live_sockets()
     return sockets[0] if sockets else None
 
@@ -50,7 +62,8 @@ def session_id():
     """$FASTADE_SESSION_ID, or the id in the socket name when only one session
     is connected (with several, a guess could file a note under the wrong one)."""
     value = os.environ.get("FASTADE_SESSION_ID")
-    if value:
+    path = os.environ.get("FASTADE_SOCK")
+    if value and (not path or alive(path)):
         return value
     sockets = live_sockets()
     if len(sockets) == 1:
@@ -111,17 +124,33 @@ def call_tool(params):
     }, None
 
 
+def initialize_result():
+    result = {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "fastade-mcp", "version": VERSION},
+    }
+    try:
+        reply = send({"op": "list_records", "profile_id": "global"})
+        sections = []
+        for record in (reply.get("records") or []) if reply.get("ok") else []:
+            title = str(record.get("title") or "").strip()
+            if record.get("kind") == "note" and title:
+                sections.append(("## " + title + "\n\n" + str(record.get("content") or "").strip()).rstrip())
+        if sections:
+            result["instructions"] = "\n\n".join(sections)
+    except Exception:  # noqa: BLE001 - MCP should still initialize without the app
+        pass
+    return result
+
+
 def handle(message):
     if "id" not in message or "method" not in message:
         return None  # a notification gets no reply
     method, params = message["method"], message.get("params") or {}
     result, error = None, None
     if method == "initialize":
-        result = {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "fastade-mcp", "version": VERSION},
-        }
+        result = initialize_result()
     elif method == "tools/list":
         try:
             result = {"tools": tools()}

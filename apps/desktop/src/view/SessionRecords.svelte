@@ -4,15 +4,19 @@
   import { TASK_STATUSES, validateRecordDraft, type SessionRecord, type TaskStatus } from '../domain/session-record';
 
   // Mount a new instance (keyed by profileId) when switching saved sessions.
-  let { profileId, sessionName, repository, revision = 0, syncNote = '', onChanged = () => {}, onClose }: {
+  let { profileId, sessionName, notesOnly = false, embedded = false, repository, revision = 0, syncNote = '', onChanged = () => {}, onClose = () => {} }: {
     profileId: string;
     sessionName: string;
+    /** Rendered inline inside another panel, so it has no close button. */
+    embedded?: boolean;
+    /** Global notes hold guidance for every agent, so there are no tasks. */
+    notesOnly?: boolean;
     repository: SessionRecordRepository;
     /** Changes when a sync replaced the local records, so the list reloads. */
     revision?: number;
     syncNote?: string;
     onChanged?: () => void;
-    onClose: () => void;
+    onClose?: () => void;
   } = $props();
   let seenRevision = untrack(() => revision);
   let records = $state<SessionRecord[]>([]);
@@ -124,19 +128,21 @@
   }
 </script>
 
-<section class="records-panel" aria-label={`Notes and tasks for ${sessionName}`}>
+<section class="records-panel" class:notes-only={notesOnly} class:embedded aria-label={notesOnly ? sessionName : `Notes and tasks for ${sessionName}`}>
   <header class="panel-header">
     <div class="panel-title">
       <span class="project-mark" aria-hidden="true"></span>
-      <div><strong>{sessionName}</strong><small>Notes &amp; tasks{syncNote ? ` · ${syncNote}` : ''}</small></div>
+      <div><strong>{sessionName}</strong><small>{notesOnly ? 'Added to every new agent context' : 'Notes & tasks'}{syncNote ? ` · ${syncNote}` : ''}</small></div>
     </div>
     <div class="panel-actions">
       <button class="icon-button" type="button" title="Refresh" aria-label="Refresh notes and tasks" disabled={busy || loading || editorOpen} onclick={() => void refresh()}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" /></svg>
       </button>
+      {#if !embedded}
       <button class="icon-button close-button" type="button" title="Close" aria-label="Close notes and tasks" disabled={busy || editorOpen} onclick={onClose}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
       </button>
+      {/if}
     </div>
   </header>
   {#if error}<p class="record-error" role="alert">{error}</p>{/if}
@@ -188,6 +194,7 @@
         </div>
       </section>
 
+      {#if !notesOnly}
       <section class="record-column task-column" aria-labelledby="tasks-heading">
         <div class="column-header">
           <div><span class="column-icon task-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2" /></svg></span><strong id="tasks-heading">Tasks</strong><span class="record-count">{tasks.length}</span></div>
@@ -214,12 +221,17 @@
           {/each}
         </div>
       </section>
+      {/if}
     </div>
   {/if}
 </section>
 
 <style>
   .records-panel { display: flex; flex-direction: column; min-width: 0; min-height: 420px; color: #e7eee9; background: #101512; }
+  .embedded { min-height: 0; border-top: 1px solid #29352e; }
+  .embedded .record-columns, .embedded .loading-state { min-height: 120px; }
+  .embedded .record-list { max-height: 280px; overflow: auto; }
+  .embedded .empty-state { min-height: 90px; padding: 16px; }
   .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 17px 18px; border-bottom: 1px solid #28322c; background: linear-gradient(180deg, #151c17, #111713); }
   .panel-title, .panel-actions, .panel-title > div, .column-header, .column-header > div, .record-heading, .record-actions, .editor-heading { display: flex; align-items: center; }
   .panel-title { gap: 11px; min-width: 0; }
@@ -234,6 +246,7 @@
   .icon-button:hover:not(:disabled) { color: #cfe0d5; border-color: #4a5d50; background: #1c2720; }
   .icon-button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
   .close-button:hover:not(:disabled) { color: #ff9da4; border-color: #744149; background: #271719; }
+  .notes-only .record-columns { grid-template-columns: minmax(0, 1fr); }
   .record-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); min-height: 390px; }
   .record-column { min-width: 0; padding: 15px 16px 18px; }
   .record-column + .record-column { border-left: 1px solid #27312a; }

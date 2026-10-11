@@ -12,6 +12,10 @@ use uuid::Uuid;
 /// on this device; nothing here talks to the backend.
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Reserved `profile_id` for notes shared by every session. fastade_mcp adds
+/// them to each new agent context, so they hold notes only, never tasks.
+pub const GLOBAL_PROFILE_ID: &str = "global";
+
 const STATUSES: [&str; 3] = ["todo", "in progress", "done"];
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -103,6 +107,9 @@ fn create_record(
         return Err("A saved session is required.".to_owned());
     }
     let valid = validate(draft)?;
+    if profile_id == GLOBAL_PROFILE_ID && valid.kind != "note" {
+        return Err("Global notes cannot be tasks.".to_owned());
+    }
     let _guard = STORE_LOCK.lock().map_err(|error| error.to_string())?;
     let path = records_path(app)?;
     let mut records = read_records(&path)?;

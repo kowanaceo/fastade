@@ -9,6 +9,7 @@
   import RemoteFolderPicker from './RemoteFolderPicker.svelte';
   import ServerPicker from './ServerPicker.svelte';
   import SessionRecords from './SessionRecords.svelte';
+  import { GLOBAL_PROFILE_ID } from '../domain/session-record';
   import TerminalPane from './TerminalPane.svelte';
 
   const recordRepository = new TauriSessionRecordRepository();
@@ -18,7 +19,7 @@
       : viewModel.recordSyncError ? `Not synced: ${viewModel.recordSyncError}`
       : 'Synced with your account.',
   );
-  let recordsTarget = $state<{ profileId: string; name: string } | null>(null);
+  let recordsTarget = $state<{ profileId: string; name: string; global?: boolean } | null>(null);
   // Open (not done) tasks per saved session profile, for the badge on the
   // notes button. Reloads when records change from a sync, MCP, or the dialog.
   let openTaskCounts = $state<Record<string, number>>({});
@@ -206,6 +207,55 @@
   function isGroupCollapsed(groupId: string): boolean {
     return collapsedGroups[groupId] ?? true;
   }
+
+  let groupQuery = $state('');
+  const visibleGroups = $derived.by(() => {
+    const query = groupQuery.trim().toLowerCase();
+    if (!query) return viewModel.sessionGroups;
+    return viewModel.sessionGroups.flatMap((group) => {
+      if (group.name.toLowerCase().includes(query)) return [group];
+      const entries = group.entries.filter((entry) => `${entry.title} ${entry.projectPath} ${entry.endpoint}`.toLowerCase().includes(query));
+      return entries.length ? [{ ...group, entries }] : [];
+    });
+  });
+
+  // Long-press a custom group's name, then drag it over another group to reorder.
+  const LONG_PRESS_MS = 450;
+  let reorderingGroupId = $state<string | null>(null);
+  let reorderOverId = $state<string | null>(null);
+  let pressTimer: ReturnType<typeof setTimeout> | undefined;
+  let suppressGroupClick = false;
+
+  function groupIdAt(x: number, y: number): string | null {
+    const block = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-group-id]');
+    return block?.dataset.groupId ?? null;
+  }
+
+  function startGroupPress(event: PointerEvent, groupId: string): void {
+    if (event.button !== 0 || groupQuery.trim()) return;
+    clearTimeout(pressTimer);
+    pressTimer = setTimeout(() => {
+      reorderingGroupId = groupId;
+      reorderOverId = groupId;
+      suppressGroupClick = true;
+      const finish = (up: PointerEvent): void => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', finish);
+        window.removeEventListener('pointercancel', finish);
+        const target = groupIdAt(up.clientX, up.clientY);
+        if (up.type === 'pointerup' && target && target !== groupId) viewModel.moveGroup(groupId, target);
+        reorderingGroupId = null;
+        reorderOverId = null;
+        setTimeout(() => { suppressGroupClick = false; }, 0);
+      };
+      const move = (m: PointerEvent): void => { reorderOverId = groupIdAt(m.clientX, m.clientY); };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', finish);
+      window.addEventListener('pointercancel', finish);
+    }, LONG_PRESS_MS);
+  }
+
+  function cancelGroupPress(): void { clearTimeout(pressTimer); }
 
   const connectedCount = $derived(viewModel.sessionGroups.reduce((sum, group) => sum + group.entries.filter((entry) => entry.status === 'running').length, 0));
   const totalEntries = $derived(viewModel.sessionGroups.reduce((sum, group) => sum + group.entries.length, 0));
@@ -401,12 +451,16 @@
           <p class="eyebrow">GROUPS · {viewModel.sessionGroups.length - 1}</p>
           <button class="eyebrow sessions-toggle" disabled={!connectedGroupIds.length} aria-pressed={connectedExpanded} title={connectedExpanded ? 'Collapse groups with connected sessions' : 'Expand every group with connected sessions'} onclick={toggleConnectedGroups}>SESSIONS · {connectedCount}/{totalEntries}</button>
         </div>
-        {#each viewModel.sessionGroups as group (group.id)}
+        <input class="group-search" type="search" bind:value={groupQuery} aria-label="Search groups and sessions" placeholder="Search" />
+        {#each visibleGroups as group (group.id)}
           {@const groupTasks = [...new Set(group.entries.flatMap((entry) => entry.profileId ?? []))].reduce((sum, id) => sum + (openTaskCounts[id] ?? 0), 0)}
           <section
             role="group"
             aria-label={`${group.name} session group`}
             class:active={group.id === viewModel.selectedGroupId}
+            class:reordering={reorderingGroupId === group.id}
+            class:reorder-over={reorderingGroupId !== null && reorderOverId === group.id && reorderingGroupId !== group.id}
+            data-group-id={group.custom ? group.id : undefined}
             class="group-block"
             ondragover={(event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'; }}
             ondrop={(event) => {
@@ -417,7 +471,10 @@
             }}
           >
             <div class="group-header">
-              <button class="group-select" aria-pressed={group.id === viewModel.selectedGroupId} onclick={() => viewModel.selectGroup(group.id)} oncontextmenu={(event) => openGroupMenu(event, group.id, group.name)}>
+              <button class="group-select" aria-pressed={group.id === viewModel.selectedGroupId}
+                onpointerdown={group.custom ? (event) => startGroupPress(event, group.id) : undefined}
+                onpointerup={cancelGroupPress} onpointerleave={cancelGroupPress}
+                onclick={() => { if (!suppressGroupClick) viewModel.selectGroup(group.id); }} oncontextmenu={(event) => openGroupMenu(event, group.id, group.name)}>
                 <strong>{group.name}</strong>
                 {#if groupTasks}<span class="group-count" aria-label={`${groupTasks} open tasks`} title={`${groupTasks} open tasks in this group`}>{groupTasks}</span>{/if}
               </button>
@@ -441,7 +498,7 @@
                 {/if}
               </div>
             </div>
-            {#if !isGroupCollapsed(group.id)}
+            {#if groupQuery.trim() || !isGroupCollapsed(group.id)}
               <div class="group-sessions">
                 {#each group.entries as entry (entry.id)}
                   <div
@@ -591,7 +648,7 @@
   <div class="settings-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) recordsTarget = null; }}>
     <div class="records-dialog" role="dialog" aria-modal="true" aria-label="Notes and tasks">
       {#key recordsTarget.profileId}
-        <SessionRecords profileId={recordsTarget.profileId} sessionName={recordsTarget.name} repository={recordRepository} revision={viewModel.recordsRevision} syncNote={recordSyncNote} onChanged={() => { localRecordsRevision += 1; viewModel.requestSync(); }} onClose={() => { recordsTarget = null; }} />
+        <SessionRecords profileId={recordsTarget.profileId} sessionName={recordsTarget.name} notesOnly={recordsTarget.global} repository={recordRepository} revision={viewModel.recordsRevision} syncNote={recordSyncNote} onChanged={() => { localRecordsRevision += 1; viewModel.requestSync(); }} onClose={() => { recordsTarget = null; }} />
       {/key}
     </div>
   </div>
@@ -688,6 +745,7 @@
       {:else}
         <div class="add-agent-action"><button type="button" onclick={addAgent}><span aria-hidden="true">+</span> Add agent</button></div>
       {/if}
+      <SessionRecords profileId={GLOBAL_PROFILE_ID} sessionName="Global Notes" notesOnly embedded repository={recordRepository} revision={viewModel.recordsRevision} syncNote={recordSyncNote} onChanged={() => { localRecordsRevision += 1; viewModel.requestSync(); }} />
     </div>
   </div>
 {/if}

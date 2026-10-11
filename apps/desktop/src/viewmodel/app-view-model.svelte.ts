@@ -1,6 +1,11 @@
 import type { DesktopClient, SshHost, TerminalEvent } from '../application/desktop-client';
 import { localHostId, localSnapshot, mergeHostUsage, parseSnapshotList, shouldUpload, windowsKey } from '../domain/usage-snapshots';
 import { syncSessionRecords } from '../application/session-record-sync';
+import {
+  activeGroupEntities, defaultNameFromEntity, groupEntityId, groupSyncStateFrom, groupsFromEntities, planGroupChanges,
+  profileGroupFromPayload, profileGroupPayload, GROUP_ENTITY_TYPE, SETTING_ENTITY_TYPE,
+  type GroupSyncState,
+} from '../domain/group-sync';
 import type { SessionRecordRepository } from '../application/session-record-repository';
 import { type AgentAccount, type AgentModelOption, type AgentUsage, type AuthUser, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type SyncEntity, type SyncPushChange, type UpdateServerInput, type UsageSnapshot, type WebAgent } from '../domain/session';
 import { detectAgentActivity, type AgentActivity } from './activity-detector';
@@ -37,13 +42,15 @@ export interface SessionGroupEntry {
  * `waiting`: an approval/confirmation prompt requires the user's attention.
  * `idle`: the agent is at its composer with no work in progress, or no agent
  * is running in this session's shell right now. */
-interface GroupDefinition { id: string; name: string; }
+interface GroupDefinition { id: string; name: string; createdAt?: number; }
 interface ShellInputActions { launch: { cli: CliKind; requestedModel?: string } | null; }
 interface SyncedRecord { version: number; hash: string; }
 interface SessionSyncState {
   cursor: number;
   profiles: Record<string, SyncedRecord>;
   devicePaths: Record<string, SyncedRecord>;
+  groups?: GroupSyncState['groups'];
+  defaultGroup?: GroupSyncState['defaultGroup'];
 }
 
 const UNGROUPED_ID = 'ungrouped';
@@ -134,6 +141,8 @@ export class AppViewModel {
   activityOverrides = $state<Record<string, string>>({});
   private sessionSyncPromise?: Promise<void>;
   private sessionSyncPending = false;
+  private applyingGroupSync = false;
+  private lastGroupSignature: string | undefined;
   private syncLoopGeneration = 0;
   private allowSyncLoop = false;
 
@@ -727,7 +736,7 @@ export class AppViewModel {
   createGroup(): void {
     const name = this.draftGroupName.trim();
     if (!name) return;
-    const group = { id: `group-${crypto.randomUUID()}`, name };
+    const group = { id: `group-${crypto.randomUUID()}`, name, createdAt: Date.now() };
     this.groupDefinitions = [...this.groupDefinitions, group];
     this.draftGroupName = '';
     this.selectedGroupId = group.id;
@@ -744,6 +753,18 @@ export class AppViewModel {
     }
     if (!this.groupDefinitions.some((group) => group.id === groupId)) return;
     this.groupDefinitions = this.groupDefinitions.map((group) => group.id === groupId ? { ...group, name: trimmedName } : group);
+    this.persistGroups();
+  }
+
+  /** Moves a custom group to the position currently held by `targetId`. */
+  moveGroup(groupId: string, targetId: string): void {
+    const from = this.groupDefinitions.findIndex((group) => group.id === groupId);
+    const to = this.groupDefinitions.findIndex((group) => group.id === targetId);
+    if (from < 0 || to < 0 || from === to) return;
+    const next = [...this.groupDefinitions];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    this.groupDefinitions = next;
     this.persistGroups();
   }
 
@@ -1402,7 +1423,15 @@ export class AppViewModel {
     let snapshot = await this.client.syncSnapshot();
     const remote = this.activeSyncEntities(snapshot.entities);
     const local = await this.localSessionEntities(deviceId);
-    const changes: SyncPushChange[] = [];
+    const changes: SyncPushChange[] = planGroupChanges({
+      previous: { groups: previous.groups ?? {}, defaultGroup: previous.defaultGroup },
+      local: this.groupDefinitions,
+      defaultName: this.defaultGroupName,
+      builtinDefaultName: DEFAULT_GROUP_NAME,
+      remote: activeGroupEntities(snapshot.entities),
+      mayMigrateLocal,
+      now: Date.now(),
+    });
 
     for (const [id, value] of local.profiles) {
       const record = previous.profiles[id];
@@ -1423,10 +1452,18 @@ export class AppViewModel {
       if (!local.devicePaths.has(id)) changes.push(this.deleteChange('device_path', id, record.version));
     }
 
+    // A server that refuses group changes must not stop profiles from syncing,
+    // and its snapshot (without our groups) must not wipe the local ones.
+    let groupError: string | null = null;
     if (changes.length) {
       const response = await this.client.syncPush(changes);
+      const isGroupEntity = (type: string) => type === GROUP_ENTITY_TYPE || type === SETTING_ENTITY_TYPE;
+      const describe = (result: { entityType: string; entityId: string; reason?: string }) => `${result.entityType}:${result.entityId}: ${result.reason ?? 'rejected'}`;
       const rejected = response.results.filter((result) => result.status === 'rejected');
-      if (rejected.length) throw new Error(rejected.map((result) => `${result.entityType}:${result.entityId}: ${result.reason ?? 'rejected'}`).join('; '));
+      const rejectedOther = rejected.filter((result) => !isGroupEntity(result.entityType));
+      if (rejectedOther.length) throw new Error(rejectedOther.map(describe).join('; '));
+      const rejectedGroups = rejected.filter((result) => isGroupEntity(result.entityType));
+      if (rejectedGroups.length) groupError = rejectedGroups.map(describe).join('; ');
       snapshot = await this.client.syncSnapshot();
     }
 
@@ -1434,11 +1471,59 @@ export class AppViewModel {
     const profiles = this.profilesFromSnapshot(finalRemote.profiles, finalRemote.devicePaths, deviceId);
     await this.client.replaceSavedSessions(profiles);
     this.savedSessions = profiles;
-    this.pruneProfileLinks(new Set(profiles.map((profile) => profile.id)));
-    this.writeSessionSyncState(user.id, snapshot.cursor, finalRemote.profiles, finalRemote.devicePaths);
+    const remoteGroups = activeGroupEntities(snapshot.entities);
+    const groups = groupError ? this.groupDefinitions : groupsFromEntities(remoteGroups.groups);
+    this.applyingGroupSync = true;
+    try {
+      if (!groupError) this.applyRemoteGroups(groups, defaultNameFromEntity(remoteGroups.defaultGroup), finalRemote.profiles);
+      this.pruneProfileLinks(new Set(profiles.map((profile) => profile.id)));
+    } finally {
+      this.applyingGroupSync = false;
+    }
+    this.lastGroupSignature = this.groupSignature();
+    this.writeSessionSyncState(
+      user.id, snapshot.cursor, finalRemote.profiles, finalRemote.devicePaths, groups,
+      groupError ? undefined : groupSyncStateFrom(remoteGroups),
+    );
     await this.syncNotesAndTasks(user.id, mayMigrateLocal, owner !== null && owner !== user.id);
     localStorage.setItem(SESSION_SYNC_OWNER_KEY, user.id);
-    this.authError = null;
+    this.authError = groupError ? `Group sync failed: ${groupError}` : null;
+  }
+
+  /** Replaces the local group list, default-group name and profile
+   * memberships with the server's. A profile pointing at a deleted or unknown
+   * group falls back to the default group. Live sessions follow a profile
+   * that was moved elsewhere. */
+  private applyRemoteGroups(groups: GroupDefinition[], defaultName: string | undefined, profileEntities: Map<string, SyncEntity>): void {
+    const previousMembership = this.profileGroupIds;
+    const nextMembership: Record<string, string> = {};
+    for (const [profileId, entity] of profileEntities) {
+      const groupId = profileGroupFromPayload(entity.payload.groupId, groups);
+      if (groupId) nextMembership[profileId] = groupId;
+    }
+    const sessionGroups = { ...this.sessionGroupIds };
+    for (const [sessionId, profileId] of Object.entries(this.sessionProfileIds)) {
+      if (previousMembership[profileId] === nextMembership[profileId]) continue;
+      if (nextMembership[profileId]) sessionGroups[sessionId] = nextMembership[profileId];
+      else delete sessionGroups[sessionId];
+    }
+    for (const [sessionId, groupId] of Object.entries(sessionGroups)) {
+      if (groupId !== UNGROUPED_ID && !groups.some((group) => group.id === groupId)) delete sessionGroups[sessionId];
+    }
+    this.groupDefinitions = groups;
+    this.defaultGroupName = defaultName ?? DEFAULT_GROUP_NAME;
+    this.profileGroupIds = nextMembership;
+    this.sessionGroupIds = sessionGroups;
+    if (this.selectedGroupId !== UNGROUPED_ID && !groups.some((group) => group.id === this.selectedGroupId)) this.selectedGroupId = UNGROUPED_ID;
+  }
+
+  /** What the account stores about groups; a change here is worth a sync. */
+  private groupSignature(): string {
+    return JSON.stringify([
+      this.defaultGroupName,
+      this.groupDefinitions.map((group) => [group.id, group.name]),
+      Object.entries(this.profileGroupIds).sort(([a], [b]) => a.localeCompare(b)),
+    ]);
   }
 
   /** Notes and tasks sync on their own: a server that cannot take them yet
@@ -1466,7 +1551,7 @@ export class AppViewModel {
     const profiles = new Map<string, { payload: Record<string, unknown>; hash: string }>();
     const devicePaths = new Map<string, { payload: Record<string, unknown>; hash: string }>();
     for (const profile of this.savedSessions) {
-      const payload = { name: profile.name, lastEndpoint: profile.lastEndpoint };
+      const payload = { name: profile.name, lastEndpoint: profile.lastEndpoint, groupId: profileGroupPayload(this.profileGroupIds[profile.id], this.groupDefinitions) };
       profiles.set(profile.id, { payload, hash: JSON.stringify(payload) });
       for (const [endpoint, projectPath] of Object.entries(profile.devicePaths)) {
         const pathPayload = { profileId: profile.id, deviceId, endpoint, projectPath };
@@ -1549,19 +1634,20 @@ export class AppViewModel {
     try {
       const users = JSON.parse(localStorage.getItem(SESSION_SYNC_STORAGE_KEY) ?? '{}') as Record<string, SessionSyncState>;
       const state = users[userId];
-      return { cursor: state?.cursor ?? 0, profiles: state?.profiles ?? {}, devicePaths: state?.devicePaths ?? {} };
+      return { cursor: state?.cursor ?? 0, profiles: state?.profiles ?? {}, devicePaths: state?.devicePaths ?? {}, groups: state?.groups, defaultGroup: state?.defaultGroup };
     } catch {
       return { cursor: 0, profiles: {}, devicePaths: {} };
     }
   }
 
-  private writeSessionSyncState(userId: string, cursor: number, profiles: Map<string, SyncEntity>, devicePaths: Map<string, SyncEntity>): void {
+  private writeSessionSyncState(userId: string, cursor: number, profiles: Map<string, SyncEntity>, devicePaths: Map<string, SyncEntity>, groups: GroupDefinition[], groupState?: GroupSyncState): void {
     let users: Record<string, SessionSyncState> = {};
     try { users = JSON.parse(localStorage.getItem(SESSION_SYNC_STORAGE_KEY) ?? '{}') as Record<string, SessionSyncState>; } catch { /* replace corrupt metadata */ }
     users[userId] = {
       cursor,
-      profiles: Object.fromEntries([...profiles].map(([id, entity]) => [id, { version: entity.version, hash: JSON.stringify({ name: entity.payload.name, lastEndpoint: entity.payload.lastEndpoint }) }])),
+      profiles: Object.fromEntries([...profiles].map(([id, entity]) => [id, { version: entity.version, hash: JSON.stringify({ name: entity.payload.name, lastEndpoint: entity.payload.lastEndpoint, groupId: profileGroupPayload(profileGroupFromPayload(entity.payload.groupId, groups), groups) }) }])),
       devicePaths: Object.fromEntries([...devicePaths].map(([id, entity]) => [id, { version: entity.version, hash: JSON.stringify({ profileId: entity.payload.profileId, deviceId: entity.payload.deviceId, endpoint: entity.payload.endpoint, projectPath: entity.payload.projectPath }) }])),
+      ...(groupState ? { groups: groupState.groups, defaultGroup: groupState.defaultGroup } : { groups: users[userId]?.groups, defaultGroup: users[userId]?.defaultGroup }),
     };
     localStorage.setItem(SESSION_SYNC_STORAGE_KEY, JSON.stringify(users));
   }
@@ -1610,9 +1696,29 @@ export class AppViewModel {
       this.sessionProfileIds = {};
       this.pinnedSessionIds = {};
     }
+    this.lastGroupSignature = this.groupSignature();
+  }
+
+  /** Mirrors group names and membership to the backend so MCP can report them. */
+  private publishGroupLayout(): void {
+    const name = (id: string | undefined): string | undefined =>
+      id === undefined ? undefined : this.groupDefinitions.find((group) => group.id === id)?.name;
+    const pick = (ids: Record<string, string>): Record<string, string> =>
+      Object.fromEntries(Object.entries(ids).flatMap(([key, id]) => name(id) ? [[key, name(id)!]] : []));
+    void this.client.setGroupLayout({
+      defaultGroup: { name: this.defaultGroupName },
+      groups: this.groupDefinitions.map((group) => ({ id: groupEntityId(group.id), name: group.name })),
+      sessions: pick(this.sessionGroupIds),
+      profiles: pick(this.profileGroupIds),
+    }).catch(() => undefined);
   }
 
   private persistGroups(): void {
+    const signature = this.groupSignature();
+    const changed = signature !== this.lastGroupSignature;
+    this.lastGroupSignature = signature;
+    if (changed && !this.applyingGroupSync) void this.syncSessionInformation();
+    this.publishGroupLayout();
     localStorage.setItem(GROUPS_STORAGE_KEY, JSON.stringify({ defaultName: this.defaultGroupName, groups: this.groupDefinitions, membership: this.sessionGroupIds, profileMembership: this.profileGroupIds, sessionProfiles: this.sessionProfileIds, pinnedSessions: this.pinnedSessionIds }));
   }
 

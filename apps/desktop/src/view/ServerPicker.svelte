@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { DesktopClient, SshHost } from '../application/desktop-client';
+  import ServerQr from './ServerQr.svelte';
   import type { CreateServerInput, ManagedServer, UpdateServerInput } from '../domain/session';
 
   type AuthKind = 'password' | 'keyFile' | 'generateKey';
@@ -43,6 +44,7 @@
   let submitting = $state(false);
   let formError = $state<string | null>(null);
   let copied = $state(false);
+  let qrServer = $state<ManagedServer | null>(null);
 
   function resetForm(): void {
     editingId = null;
@@ -188,12 +190,16 @@
             <div class="editor-actions wide"><button type="button" onclick={() => { showForm = false; resetForm(); }}>Cancel</button><button class="primary" type="submit" disabled={submitting}>{submitting ? 'Saving…' : editingId ? 'Save' : 'Create'}</button></div>
           </form>
         {/if}
+        {#if qrServer}<ServerQr server={qrServer} {client} onClose={() => { qrServer = null; }} />{/if}
         {#if managedServers.length}
           <div class="server-list">
             {#each managedServers as server (server.id)}
               <div class="server-row-wrap">
                 <button class="server-row" onclick={() => onSelectManagedServer(server)}>
                   <strong>{server.name}</strong><small>{server.username}@{server.host}:{server.port} · {server.auth.kind === 'password' ? 'password' : 'key'}</small>
+                </button>
+                <button class="server-edit" aria-label={`Show QR code for ${server.name}`} title="QR code" onclick={(event) => { event.stopPropagation(); qrServer = qrServer?.id === server.id ? null : server; }}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z" /></svg>
                 </button>
                 <button class="server-edit" aria-label={`Edit ${server.name}`} title="Edit" onclick={(event) => { event.stopPropagation(); openEditForm(server); }}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zm8.9 2.4-1.6-.4a7.3 7.3 0 0 0-.5-1.2l.9-1.4a1 1 0 0 0-.1-1.2l-1.3-1.3a1 1 0 0 0-1.2-.1l-1.4.9a7.3 7.3 0 0 0-1.2-.5l-.4-1.6a1 1 0 0 0-1-.8h-1.8a1 1 0 0 0-1 .8l-.4 1.6a7.3 7.3 0 0 0-1.2.5l-1.4-.9a1 1 0 0 0-1.2.1L3.9 6.7a1 1 0 0 0-.1 1.2l.9 1.4a7.3 7.3 0 0 0-.5 1.2l-1.6.4a1 1 0 0 0-.8 1v1.8a1 1 0 0 0 .8 1l1.6.4c.13.43.3.83.5 1.2l-.9 1.4a1 1 0 0 0 .1 1.2l1.3 1.3a1 1 0 0 0 1.2.1l1.4-.9c.37.2.77.37 1.2.5l.4 1.6a1 1 0 0 0 1 .8h1.8a1 1 0 0 0 1-.8l.4-1.6c.43-.13.83-.3 1.2-.5l1.4.9a1 1 0 0 0 1.2-.1l1.3-1.3a1 1 0 0 0 .1-1.2l-.9-1.4c.2-.37.37-.77.5-1.2l1.6-.4a1 1 0 0 0 .8-1v-1.8a1 1 0 0 0-.8-1z" /></svg>

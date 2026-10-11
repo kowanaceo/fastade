@@ -90,6 +90,41 @@ pub fn list_managed_servers(app: tauri::AppHandle) -> Result<Vec<ManagedServer>,
     read_servers(&servers_path(&app)?)
 }
 
+/// Secrets for a server QR code. Only read on explicit request, since the QR
+/// puts them on screen.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerQrCredentials {
+    password: Option<String>,
+    /// OpenSSH private key, base64url without padding.
+    key: Option<String>,
+}
+
+#[tauri::command]
+pub fn get_server_qr_credentials(
+    id: String,
+    app: tauri::AppHandle,
+) -> Result<ServerQrCredentials, String> {
+    let servers = read_servers(&servers_path(&app)?)?;
+    let server = servers
+        .iter()
+        .find(|server| server.id == id)
+        .ok_or_else(|| "Could not find the server.".to_owned())?;
+    match &server.auth {
+        AuthMethod::Password => {
+            let password = keychain_entry(&id)?
+                .get_password()
+                .map_err(|error| format!("Failed to read the password from the keychain: {error}"))?;
+            Ok(ServerQrCredentials { password: Some(password), key: None })
+        }
+        AuthMethod::KeyFile { path } => {
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+            let bytes = fs::read(path).map_err(|error| format!("Could not read the key file: {error}"))?;
+            Ok(ServerQrCredentials { password: None, key: Some(URL_SAFE_NO_PAD.encode(bytes)) })
+        }
+    }
+}
+
 #[tauri::command]
 pub fn create_managed_server(
     input: CreateServerInput,

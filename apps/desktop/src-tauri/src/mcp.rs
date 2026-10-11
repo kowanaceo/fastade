@@ -19,19 +19,36 @@ pub fn socket_path() -> Option<PathBuf> {
     Some(base.join("com.fastade.desktop").join("fastade.sock"))
 }
 
+/// The listener itself closes with the process, but its filesystem entry can
+/// otherwise survive a normal app exit. Crashes are covered by the unlink
+/// before bind in `start`; this guard keeps the ordinary lifecycle clean too.
+struct SocketCleanup(PathBuf);
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// The MCP tool list, defined once here so the local stdio bridge and the
 /// remote (Python) bridge, which asks the app for it, always agree.
 pub fn tool_definitions() -> serde_json::Value {
     use serde_json::json;
     json!([
         {
+            "name": "list_groups",
+            "description": "Return the fastade session groups in sidebar order, plus the name of the default group that holds ungrouped sessions.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": { "readOnlyHint": true }
+        },
+        {
             "name": "list_sessions",
-            "description": "Return every saved fastade session, local or remote (SSH), overlaid with runtime session ID, current agent/model, per-agent last model metadata, status, hook-reported activity and memory usage when available. Saved entries that have not been opened are returned as disconnected.",
+            "description": "Return every saved fastade session, local or remote (SSH), with its sidebar group name, overlaid with runtime session ID, current agent/model, per-agent last model metadata, status, hook-reported activity and memory usage when available. Saved entries that have not been opened are returned as disconnected.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "list_projects",
-            "description": "Return every project shown in fastade, one entry per saved project, with its name, current endpoint, project path, and paths remembered for other devices.",
+            "description": "Return every project shown in fastade, one entry per saved project, with its name, sidebar group, current endpoint, project path, and paths remembered for other devices.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -40,7 +57,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "profile_id": { "type": "string", "description": "A saved session's profileId from list_sessions." }
+                    "profile_id": { "type": "string", "description": "A saved session's profileId from list_sessions, or \"global\" for the global notes shared by every agent." }
                 }
             }
         },
@@ -54,7 +71,7 @@ pub fn tool_definitions() -> serde_json::Value {
                     "title": { "type": "string" },
                     "content": { "type": "string" },
                     "status": { "type": "string", "enum": ["todo", "in progress", "done"], "description": "Tasks only." },
-                    "profile_id": { "type": "string" }
+                    "profile_id": { "type": "string", "description": "A saved session's profileId, or \"global\" to add a note (not a task) to the global notes shared by every agent." }
                 },
                 "required": ["kind", "title"]
             }
@@ -85,10 +102,86 @@ pub fn tool_definitions() -> serde_json::Value {
     ])
 }
 
+/// The sidebar's groups live in the window; it pushes them here so MCP
+/// callers can see which group each session or project sits in.
+#[derive(Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupLayout {
+    default_group: Option<DefaultGroup>,
+    /// Custom groups in sidebar order. IDs use the same bare UUIDs as the
+    /// account MCP; the UI's internal `group-` prefix never leaks into MCP.
+    groups: Vec<Group>,
+    sessions: std::collections::HashMap<String, String>,
+    profiles: std::collections::HashMap<String, String>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+struct DefaultGroup {
+    name: String,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+struct Group {
+    id: String,
+    name: String,
+}
+
+fn groups_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|dir| dir.join("groups.json"))
+}
+
+#[tauri::command]
+pub fn set_group_layout(layout: GroupLayout, app: tauri::AppHandle) -> Result<(), String> {
+    let path = groups_path(&app).ok_or("app data directory is unavailable")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let json = serde_json::to_string(&layout).map_err(|error| error.to_string())?;
+    std::fs::write(path, json).map_err(|error| error.to_string())
+}
+
+fn read_group_layout(app: &tauri::AppHandle) -> GroupLayout {
+    groups_path(app)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Adds `group` to each object whose `sessionId`/`profileId`/`id` is known.
+fn annotate_groups(items: &mut serde_json::Value, layout: &GroupLayout, by_session: bool) {
+    let default_group = layout
+        .default_group
+        .as_ref()
+        .map(|group| group.name.clone());
+    let Some(items) = items.as_array_mut() else {
+        return;
+    };
+    for item in items {
+        let text = |key: &str| item.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        let group = (by_session
+            .then(|| text("sessionId").and_then(|id| layout.sessions.get(&id).cloned()))
+            .flatten())
+        .or_else(|| {
+            let profile = if by_session {
+                text("profileId")
+            } else {
+                text("id")
+            };
+            profile.and_then(|id| layout.profiles.get(&id).cloned())
+        })
+        .or_else(|| default_group.clone());
+        item["group"] = serde_json::json!(group);
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {
+    ListGroups,
     ListSessions,
     ListProjects,
     /// The MCP tool list, for bridges that cannot embed it.
@@ -130,6 +223,7 @@ enum Request {
 #[cfg(unix)]
 pub fn start(app: tauri::AppHandle) {
     use std::os::unix::net::UnixListener;
+    use tauri::Manager;
 
     let Some(path) = socket_path() else { return };
     if let Some(parent) = path.parent() {
@@ -141,6 +235,7 @@ pub fn start(app: tauri::AppHandle) {
     let Ok(listener) = UnixListener::bind(&path) else {
         return;
     };
+    app.manage(SocketCleanup(path));
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let app = app.clone();
@@ -187,12 +282,28 @@ fn handle_request(app: &tauri::AppHandle, request: Request) -> serde_json::Value
 
     let state = app.state::<crate::session::AppState>();
     match request {
+        Request::ListGroups => {
+            let layout = read_group_layout(app);
+            serde_json::json!({
+                "ok": true,
+                "defaultGroup": layout.default_group,
+                "groups": layout.groups,
+            })
+        }
         Request::ListSessions => match crate::session::mcp_sessions(app, &state) {
-            Ok(sessions) => serde_json::json!({ "ok": true, "sessions": sessions }),
+            Ok(sessions) => {
+                let mut sessions = serde_json::json!(sessions);
+                annotate_groups(&mut sessions, &read_group_layout(app), true);
+                serde_json::json!({ "ok": true, "sessions": sessions })
+            }
             Err(error) => serde_json::json!({ "ok": false, "error": error }),
         },
         Request::ListProjects => match crate::saved_sessions::mcp_projects(app.clone()) {
-            Ok(projects) => serde_json::json!({ "ok": true, "projects": projects }),
+            Ok(projects) => {
+                let mut projects = serde_json::json!(projects);
+                annotate_groups(&mut projects, &read_group_layout(app), false);
+                serde_json::json!({ "ok": true, "projects": projects })
+            }
             Err(error) => serde_json::json!({ "ok": false, "error": error }),
         },
         Request::Tools => serde_json::json!({ "ok": true, "tools": tool_definitions() }),
@@ -218,7 +329,9 @@ fn handle_request(app: &tauri::AppHandle, request: Request) -> serde_json::Value
             status,
         } => {
             let result = resolve_profile(app, &state, profile_id, session_id, true)
-                .and_then(|profile| profile.ok_or_else(|| "A saved session is required.".to_owned()))
+                .and_then(|profile| {
+                    profile.ok_or_else(|| "A saved session is required.".to_owned())
+                })
                 .and_then(|profile| {
                     crate::records::mcp_create_record(app, profile, kind, title, content, status)
                 });
@@ -234,15 +347,13 @@ fn handle_request(app: &tauri::AppHandle, request: Request) -> serde_json::Value
             crate::records::mcp_update_record(app, &id, title, content, status)
                 .map(|record| ("record", record)),
         ),
-        Request::DeleteRecord { id } => {
-            match crate::records::delete_record(app, &id) {
-                Ok(()) => {
-                    let _ = app.emit("records-changed", ());
-                    serde_json::json!({ "ok": true })
-                }
-                Err(error) => serde_json::json!({ "ok": false, "error": error }),
+        Request::DeleteRecord { id } => match crate::records::delete_record(app, &id) {
+            Ok(()) => {
+                let _ = app.emit("records-changed", ());
+                serde_json::json!({ "ok": true })
             }
-        }
+            Err(error) => serde_json::json!({ "ok": false, "error": error }),
+        },
         Request::ReportActivity {
             session_id,
             state: activity,
@@ -287,13 +398,19 @@ fn resolve_profile(
     required: bool,
 ) -> Result<Option<String>, String> {
     if let Some(id) = profile_id.filter(|id| !id.trim().is_empty()) {
+        if id == crate::records::GLOBAL_PROFILE_ID {
+            return Ok(Some(id));
+        }
         let known = crate::saved_sessions::list_saved_sessions(app.clone())?
             .iter()
             .any(|profile| profile.id == id);
         return if known {
             Ok(Some(id))
         } else {
-            Err("Unknown profile_id. Use list_sessions to find a saved session's profileId.".to_owned())
+            Err(
+                "Unknown profile_id. Use list_sessions to find a saved session's profileId."
+                    .to_owned(),
+            )
         };
     }
     if let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) {

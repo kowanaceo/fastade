@@ -47,11 +47,7 @@ fn handle_message(message: Value) -> Option<Value> {
     let params = message.get("params").cloned().unwrap_or(json!({}));
 
     let result = match method.as_str() {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "fastade-mcp", "version": env!("CARGO_PKG_VERSION") }
-        })),
+        "initialize" => Ok(initialize_result(load_global_notes().as_deref())),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
         "tools/call" => call_tool(params),
         other => Err(json!({ "code": -32601, "message": format!("method not found: {other}") })),
@@ -63,9 +59,54 @@ fn handle_message(message: Value) -> Option<Value> {
     })
 }
 
+/// MCP server instructions are added to the agent's context by clients such
+/// as Codex. The global notes are always-on guidance, so they travel here
+/// instead of waiting for the model to discover them with a tool.
+fn initialize_result(instructions: Option<&str>) -> Value {
+    let mut result = json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": "fastade-mcp", "version": env!("CARGO_PKG_VERSION") }
+    });
+    if let Some(text) = instructions.filter(|text| !text.trim().is_empty()) {
+        result["instructions"] = json!(text);
+    }
+    result
+}
+
+/// Initialization must remain usable when the desktop app is temporarily
+/// unavailable. In that case the bridge starts without custom instructions;
+/// once fastade is reachable, a newly started agent receives them normally.
+fn load_global_notes() -> Option<String> {
+    let response = send_to_app(&json!({ "op": "list_records", "profile_id": "global" })).ok()?;
+    if response.get("ok") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    format_global_notes(response.get("records")?.as_array()?)
+}
+
+/// One `## title` section per note, oldest first.
+fn format_global_notes(records: &[Value]) -> Option<String> {
+    let sections: Vec<String> = records
+        .iter()
+        .filter(|record| record["kind"] == "note")
+        .filter_map(|record| {
+            let title = record["title"].as_str()?.trim();
+            let content = record["content"].as_str().unwrap_or("").trim();
+            Some(format!("## {title}\n\n{content}").trim_end().to_owned())
+        })
+        .collect();
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
+}
+
 /// Notes and tasks only: session control (sending input, stopping agents)
 /// stays out of MCP on purpose.
-const RECORD_TOOLS: [&str; 4] = ["list_records", "create_record", "update_record", "delete_record"];
+const RECORD_TOOLS: [&str; 4] = [
+    "list_records",
+    "create_record",
+    "update_record",
+    "delete_record",
+];
 
 /// The tool arguments plus the caller's own fastade session, so a record
 /// lands on the session the agent is working in without it knowing any ids.
@@ -85,6 +126,7 @@ fn call_tool(params: Value) -> Result<Value, Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| json!({ "code": -32602, "message": "missing tool name" }))?;
     let request = match name {
+        "list_groups" => json!({ "op": "list_groups" }),
         "list_sessions" => json!({ "op": "list_sessions" }),
         "list_projects" => json!({ "op": "list_projects" }),
         record if RECORD_TOOLS.contains(&record) => {
@@ -247,10 +289,14 @@ mod tests {
     fn exposes_listing_and_record_tools_but_no_session_control() {
         let tools = tool_definitions();
         let tools = tools.as_array().expect("tool definitions must be an array");
-        let names: Vec<_> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+        let names: Vec<_> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
         assert_eq!(
             names,
             [
+                "list_groups",
                 "list_sessions",
                 "list_projects",
                 "list_records",
@@ -266,6 +312,35 @@ mod tests {
     }
 
     #[test]
+    fn initialize_injects_the_global_notes() {
+        let result = initialize_result(Some("Build apps accessibly.\nUse semantic HTML."));
+        assert_eq!(
+            result["instructions"],
+            "Build apps accessibly.\nUse semantic HTML."
+        );
+    }
+
+    #[test]
+    fn global_notes_become_one_section_each() {
+        let records = [
+            json!({ "kind": "note", "title": "Apps", "content": "Ship a README.\n" }),
+            json!({ "kind": "task", "title": "Ignored", "content": "x" }),
+            json!({ "kind": "note", "title": "Web", "content": "" }),
+        ];
+        assert_eq!(
+            format_global_notes(&records).unwrap(),
+            "## Apps\n\nShip a README.\n\n## Web"
+        );
+        assert!(format_global_notes(&[]).is_none());
+    }
+
+    #[test]
+    fn initialize_omits_empty_instructions() {
+        assert!(initialize_result(None).get("instructions").is_none());
+        assert!(initialize_result(Some("  \n")).get("instructions").is_none());
+    }
+
+    #[test]
     fn record_requests_carry_the_op_and_ignore_a_spoofed_session() {
         let request = record_request(
             "create_record",
@@ -274,7 +349,10 @@ mod tests {
         assert_eq!(request["op"], "create_record");
         assert_eq!(request["title"], "t");
         assert_ne!(request["session_id"], "attacker");
-        assert_eq!(record_request("list_records", &Value::Null)["op"], "list_records");
+        assert_eq!(
+            record_request("list_records", &Value::Null)["op"],
+            "list_records"
+        );
     }
 
     #[test]

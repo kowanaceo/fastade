@@ -12,7 +12,7 @@ A desktop client for running and managing Codex CLI, Claude Code, and Gemini CLI
 - Run Codex CLI, Claude Code, and Gemini CLI with configurable default models
 - Per-session terminal pop-out windows with activity status and memory usage
 - Codex and Claude Code usage display
-- Optional read-only MCP integration to query the state of all sessions
+- Optional MCP integration for session state, notes/tasks, and shared global notes
 
 ## Requirements
 
@@ -129,6 +129,10 @@ When you enable MCP integration in settings, fastade adds a `fastade_mcp` entry 
 | Gemini CLI | `~/.gemini/settings.json` | Inferred from terminal output |
 
 fastade removes only the entries it created and leaves your existing settings intact. Codex may not run new hooks immediately: open `/hooks` in Codex and review and trust the hooks fastade added, otherwise the working/idle status will not be accurate.
+
+Global Notes (Settings → Manage) is a list of account-wide notes you can add, edit and delete. They are ordinary notes stored under the reserved `profile_id` `global`, so they sync with your other notes. fastade returns them as the MCP server's `instructions` (one `## title` section per note) whenever a new agent context initializes, which makes them suitable for required app, web, and workflow guidance rather than session-specific notes. Already-running contexts keep the notes they started with. Agents manage them with the usual `list_records`, `create_record`, `update_record` and `delete_record` tools by passing `profile_id: "global"`; global notes cannot be tasks.
+
+MCP has two transient socket entries: the desktop app-data `fastade.sock`, which is unlinked before startup and on normal shutdown, and an SSH session's `/tmp/fastade-<session-id>.sock`, whose stale entry OpenSSH unlinks before recreating the forward (`StreamLocalBindUnlink=yes`). The remote `~/.fastade/bin/fastade-mcp` relay and the CLI config entries are durable installation files, not temporary connection state; they are reconciled when a remote session starts. No token or port file is written to the remote host.
 
 SSH passwords are stored in the OS secure storage.
 
