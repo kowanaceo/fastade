@@ -29,7 +29,8 @@ use saved_sessions::{
     save_session_profile, update_saved_session,
 };
 use servers::{
-    create_managed_server, delete_managed_server, list_managed_servers, update_managed_server,
+    create_managed_server, delete_managed_server, get_server_qr_credentials, list_managed_servers,
+    update_managed_server,
 };
 use session::{
     clear_session_activity_override, close_session, create_session, get_home_directory,
@@ -67,6 +68,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
+            mcp::set_group_layout,
             create_session,
             get_home_directory,
             write_terminal,
@@ -89,6 +91,7 @@ pub fn run() {
             create_managed_server,
             update_managed_server,
             delete_managed_server,
+            get_server_qr_credentials,
             open_session_window,
             get_agent_usage,
             get_remote_usage,

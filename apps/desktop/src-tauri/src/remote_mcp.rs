@@ -223,6 +223,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":0,"method":"initialize"}}"#).unwrap();
         writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list"}}"#).unwrap();
         writeln!(
             stdin,
@@ -240,9 +241,10 @@ mod tests {
         child.wait().unwrap();
         let replies: Vec<serde_json::Value> =
             output.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-        assert_eq!(replies[0]["result"]["tools"][0]["name"], "create_record");
-        assert_eq!(replies[1]["result"]["isError"], false);
-        assert_eq!(replies[2]["error"]["code"], -32602, "unlisted tools are refused");
+        assert!(replies[0]["result"].get("instructions").is_none());
+        assert_eq!(replies[1]["result"]["tools"][0]["name"], "create_record");
+        assert_eq!(replies[2]["result"]["isError"], false);
+        assert_eq!(replies[3]["error"]["code"], -32602, "unlisted tools are refused");
 
         let hook = Command::new("python3")
             .args([script.to_str().unwrap(), "report-activity", "working"])

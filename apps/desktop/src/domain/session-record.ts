@@ -13,6 +13,9 @@ export type SessionRecord = SessionRecordDraft & {
   updatedAt: number;
 };
 
+/** Reserved profile id for notes shared by every agent (see records.rs). */
+export const GLOBAL_PROFILE_ID = 'global';
+
 export const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'in progress', 'done'];
 
 /** Shared by direct editing and a future backend/MCP adapter. Content is

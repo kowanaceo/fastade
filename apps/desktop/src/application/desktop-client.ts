@@ -34,12 +34,14 @@ export interface DesktopClient {
   rememberSavedSessionPath(id: string, endpoint: string, projectPath: string): Promise<SavedSessionProfile>;
   updateSavedSession(id: string, name: string, endpoint: string, projectPath: string): Promise<SavedSessionProfile>;
   deleteSavedSession(id: string): Promise<void>;
+  setGroupLayout(layout: { defaultGroup: { name: string }; groups: { id: string; name: string }[]; sessions: Record<string, string>; profiles: Record<string, string> }): Promise<void>;
   replaceSavedSessions(profiles: SavedSessionProfile[]): Promise<void>;
   listSshHosts(): Promise<SshHost[]>;
   listManagedServers(): Promise<ManagedServer[]>;
   createManagedServer(input: CreateServerInput): Promise<CreatedServer>;
   updateManagedServer(input: UpdateServerInput): Promise<CreatedServer>;
   deleteManagedServer(id: string): Promise<void>;
+  getServerQrCredentials(id: string): Promise<{ password?: string | null; key?: string | null }>;
   listRemoteDirectory(endpoint: string, path: string): Promise<RemoteDirectoryListing>;
   getHomeDirectory(): Promise<string | null>;
   selectFolder(defaultPath?: string): Promise<string | null>;

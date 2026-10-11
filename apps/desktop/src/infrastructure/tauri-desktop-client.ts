@@ -29,6 +29,10 @@ export class TauriDesktopClient implements DesktopClient {
     return invoke<void>('delete_saved_session', { id });
   }
 
+  setGroupLayout(layout: { defaultGroup: { name: string }; groups: { id: string; name: string }[]; sessions: Record<string, string>; profiles: Record<string, string> }): Promise<void> {
+    return invoke<void>('set_group_layout', { layout });
+  }
+
   replaceSavedSessions(profiles: SavedSessionProfile[]): Promise<void> {
     return invoke<void>('replace_saved_sessions', { profiles });
   }
@@ -55,6 +59,10 @@ export class TauriDesktopClient implements DesktopClient {
 
   deleteManagedServer(id: string): Promise<void> {
     return invoke<void>('delete_managed_server', { id });
+  }
+
+  getServerQrCredentials(id: string): Promise<{ password?: string | null; key?: string | null }> {
+    return invoke('get_server_qr_credentials', { id });
   }
 
   getHomeDirectory(): Promise<string | null> {
