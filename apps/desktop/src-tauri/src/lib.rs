@@ -33,8 +33,8 @@ use servers::{
     update_managed_server,
 };
 use session::{
-    clear_session_activity_override, close_session, create_session, get_home_directory,
-    interrupt_session, list_sessions, reconnect_session, resize_terminal,
+    clear_session_activity_override, close_session, close_temporary_sessions, create_session,
+    get_home_directory, interrupt_session, list_sessions, reconnect_session, resize_terminal,
     session_activity_overrides, session_memory_usage, terminal_snapshot, update_session_agent,
     update_session_context, upload_file_to_session, write_terminal, AppState,
 };
@@ -57,6 +57,7 @@ pub fn run() {
                 fit_windows_after_display_change(window.app_handle());
             }
             tauri::WindowEvent::Resized(_) => fit_window_after_resize(window),
+            tauri::WindowEvent::Destroyed => close_temporary_sessions(window),
             _ => {}
         })
         .setup(|app| {

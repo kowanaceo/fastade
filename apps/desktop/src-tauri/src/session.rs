@@ -104,6 +104,9 @@ pub struct SessionSummary {
     pub endpoint: String,
     pub project_path: String,
     pub status: SessionStatus,
+    /// Popup shells belong to their originating window and never survive a restart.
+    #[serde(skip)]
+    temporary_owner: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -192,6 +195,8 @@ pub struct CreateSessionInput {
     title: String,
     endpoint: String,
     project_path: String,
+    #[serde(default)]
+    temporary: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -207,7 +212,7 @@ pub fn list_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<SessionSum
     state
         .sessions
         .lock()
-        .map(|value| value.clone())
+        .map(|value| regular_sessions(&value))
         .map_err(|_| "session store is unavailable".to_owned())
 }
 
@@ -246,6 +251,7 @@ pub fn create_session(
     input: CreateSessionInput,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
+    window: tauri::Window,
 ) -> Result<SessionSummary, String> {
     validate_input(&input)?;
     let session = SessionSummary {
@@ -258,6 +264,7 @@ pub fn create_session(
         endpoint: input.endpoint,
         project_path: input.project_path,
         status: SessionStatus::Running,
+        temporary_owner: input.temporary.then(|| window.label().to_owned()),
     };
     state
         .sessions
@@ -589,6 +596,26 @@ pub fn close_session(
     Ok(())
 }
 
+/// Closing an auxiliary window must also release any popup PTYs it owns.
+pub fn close_temporary_sessions(window: &tauri::Window) {
+    let app = window.app_handle();
+    let state = app.state::<AppState>();
+    let ids: Vec<String> = state
+        .sessions
+        .lock()
+        .map(|sessions| {
+            sessions
+                .iter()
+                .filter(|session| session.temporary_owner.as_deref() == Some(window.label()))
+                .map(|session| session.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in ids {
+        let _ = close_session(id, app.state::<AppState>(), app.clone());
+    }
+}
+
 fn spawn_terminal(
     session: &SessionSummary,
     state: &tauri::State<'_, AppState>,
@@ -884,9 +911,17 @@ fn persist_sessions(state: &AppState) -> Result<(), String> {
     let sessions = state
         .sessions
         .lock()
-        .map_err(|_| "session store is unavailable".to_owned())?
-        .clone();
+        .map(|sessions| regular_sessions(&sessions))
+        .map_err(|_| "session store is unavailable".to_owned())?;
     write_sessions(&state.sessions_path, &sessions)
+}
+
+fn regular_sessions(sessions: &[SessionSummary]) -> Vec<SessionSummary> {
+    sessions
+        .iter()
+        .filter(|session| session.temporary_owner.is_none())
+        .cloned()
+        .collect()
 }
 
 fn write_sessions(path: &Path, sessions: &[SessionSummary]) -> Result<(), String> {
@@ -1119,6 +1154,7 @@ fn merge_mcp_sessions(
     memory: &HashMap<String, u64>,
     activity: &HashMap<String, String>,
 ) -> Vec<McpSessionSummary> {
+    sessions.retain(|session| session.temporary_owner.is_none());
     let mut result = Vec::with_capacity(profiles.len().max(sessions.len()));
     for profile in profiles {
         let project_path = profile
@@ -1319,7 +1355,8 @@ pub(crate) fn shell_quote(value: &str) -> String {
 mod tests {
     use super::{
         apply_agent_metadata, apply_session_agent, build_command, merge_mcp_sessions,
-        remote_mcp_enabled, resolve_program, shell_quote, AgentModelSource, ManagedConnection,
+        persist_sessions, read_sessions, regular_sessions, remote_mcp_enabled, resolve_program,
+        shell_quote, AgentModelSource, AppState, CreateSessionInput, ManagedConnection,
         SessionStatus, SessionSummary, Utf8StreamDecoder,
     };
     use crate::saved_sessions::SavedSession;
@@ -1336,6 +1373,7 @@ mod tests {
             endpoint: endpoint.to_owned(),
             project_path: project_path.to_owned(),
             status: SessionStatus::Running,
+            temporary_owner: None,
         }
     }
 
@@ -1356,6 +1394,54 @@ mod tests {
     #[test]
     fn shell_quote_handles_single_quotes() {
         assert_eq!(shell_quote("it's safe"), "'it'\"'\"'s safe'");
+    }
+
+    #[test]
+    fn popup_shells_are_excluded_from_the_grid_mcp_and_persistence() {
+        let mut parent = session("local", "/project with spaces");
+        parent.id = "parent".to_owned();
+        let mut popup = parent.clone();
+        popup.id = "popup".to_owned();
+        popup.temporary_owner = Some("main".to_owned());
+        let sessions = vec![popup, parent];
+        let visible = regular_sessions(&sessions);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "parent");
+
+        let merged = merge_mcp_sessions(
+            Vec::new(),
+            sessions.clone(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let value = serde_json::to_value(merged).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["sessionId"], "parent");
+
+        let directory =
+            std::env::temp_dir().join(format!("fastade-popup-{}", uuid::Uuid::new_v4()));
+        let state = AppState {
+            sessions: std::sync::Mutex::new(sessions),
+            terminals: Default::default(),
+            transcripts: Default::default(),
+            sessions_path: directory.join("sessions.json"),
+            activity_overrides: Default::default(),
+        };
+        persist_sessions(&state).unwrap();
+        let restored = read_sessions(&state.sessions_path).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, "parent");
+        assert_eq!(restored[0].project_path, "/project with spaces");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ordinary_session_creation_remains_the_default() {
+        let input: CreateSessionInput = serde_json::from_value(serde_json::json!({
+            "title": "project", "endpoint": "local", "projectPath": "/project"
+        }))
+        .unwrap();
+        assert!(!input.temporary);
     }
 
     #[test]
@@ -1384,6 +1470,7 @@ mod tests {
             endpoint: "local".to_owned(),
             project_path: "/active".to_owned(),
             status: SessionStatus::Running,
+            temporary_owner: None,
         }];
 
         let merged = merge_mcp_sessions(profiles, sessions, &HashMap::new(), &HashMap::new());

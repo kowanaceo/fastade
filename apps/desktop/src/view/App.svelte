@@ -2,7 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { createDesktopClient } from '../application/client-provider';
-  import { type CliKind, type WebAgent } from '../domain/session';
+  import { type CliKind, type CliSessionSummary, type WebAgent } from '../domain/session';
   import { snapshotAge, unlistedAgentIds } from '../domain/usage-snapshots';
   import { AppViewModel } from '../viewmodel/app-view-model.svelte';
   import { TauriSessionRecordRepository } from '../infrastructure/tauri-session-record-repository';
@@ -11,6 +11,7 @@
   import SessionRecords from './SessionRecords.svelte';
   import { GLOBAL_PROFILE_ID } from '../domain/session-record';
   import TerminalPane from './TerminalPane.svelte';
+  import ShellPopup from './ShellPopup.svelte';
 
   const recordRepository = new TauriSessionRecordRepository();
   const viewModel = new AppViewModel(createDesktopClient(), recordRepository);
@@ -74,6 +75,25 @@
   let agentEditorOpen = $state(false);
   let agentDraft = $state<WebAgent>(emptyAgent());
   let terminalLayoutRevision = $state(0);
+  let shellPopup = $state<CliSessionSummary | null>(null);
+
+  function openShellPopup(sessionId: string): void {
+    const session = viewModel.sessions.find((item) => item.id === sessionId);
+    if (session) {
+      viewModel.selectSession(sessionId);
+      if (shellPopup?.id !== sessionId) shellPopup = { ...session };
+      void tick().then(() => {
+        document.querySelector<HTMLElement>(`[data-session-id="${CSS.escape(sessionId)}"] [data-shell-popup] .xterm-helper-textarea`)?.focus();
+      });
+    }
+    closeContextMenus();
+  }
+
+  function closeShellPopup(): void {
+    const sourceId = shellPopup?.id;
+    shellPopup = null;
+    if (sourceId) void focusTerminal(sourceId);
+  }
 
   function emptyAgent(): WebAgent {
     return { id: `web-${crypto.randomUUID()}`, name: '', chatUrl: '', usageUrl: '', accent: '#8eefaa', enabled: true };
@@ -129,6 +149,8 @@
       else viewModel.increaseFontSize();
       return;
     }
+    // Keyboard input inside the shell belongs to its PTY, including Tab/Esc.
+    if (event.target instanceof Element && event.target.closest('[data-shell-popup]')) return;
     if (!poppedSessionId && event.key === 'Tab' && !event.metaKey && event.ctrlKey !== event.altKey) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -593,6 +615,7 @@
                 {#if memoryLabel}<span class="memory-chip" title="Resident memory used by this session's shell and its child processes">{memoryLabel}</span>{/if}
                 <span title={session.endpoint}>⌁ {viewModel.endpointLabel(session.endpoint)}</span>
                 <button class="folder folder-confirm" disabled={agentRunning} title={agentRunning ? 'Stop the running agent (■) before changing folders' : `${session.projectPath} — click to change folder (also renames the session)`} onclick={(event) => { event.stopPropagation(); void viewModel.changeFolder(session.id); }}>⌂ {session.projectPath}</button>
+                <button class="upload shell-popup-button" title="Open a separate shell in this folder" aria-label={`Open shell in ${session.projectPath}`} aria-expanded={shellPopup?.id === session.id} onclick={(event) => { event.stopPropagation(); openShellPopup(session.id); }}>&gt;_</button>
                 <button class="upload" disabled={!recordProfile} title={recordProfile ? 'Notes and tasks for this project (stored on this device)' : 'Keep this session in Ungrouped (+) to attach notes and tasks'} aria-label={`Notes and tasks for ${session.title}${openTasks ? `, ${openTasks} open` : ''}`} onclick={(event) => { event.stopPropagation(); if (recordProfile) recordsTarget = { profileId: recordProfile.id, name: recordProfile.name }; }}><svg class="records-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3.5l1.2 1.2L6.4 2.5M3 8.5l1.2 1.2L6.4 7.5M3 13.5l1.2 1.2 2.2-2.2M8.5 4h5M8.5 9h5M8.5 14h5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>{#if openTasks}<span class="task-badge">{openTasks > 99 ? '99+' : openTasks}</span>{/if}</button>
                 <button class="upload" disabled={viewModel.uploadingFiles[session.id]} title={session.endpoint === 'local' ? 'Upload files — copies them into this session’s folder' : 'Upload files — sends them into this session’s folder over SSH'} onclick={(event) => { event.stopPropagation(); void viewModel.uploadFiles(session.id); }}>{viewModel.uploadingFiles[session.id] ? '⇪…' : '⇪'}</button>
                 <span class="state" data-status={session.status}>{session.status}</span>
@@ -623,6 +646,9 @@
               onCurrentDirectory={(id, path) => viewModel.updateCurrentDirectory(id, path)}
               onActivityScreen={(id, screen) => viewModel.observeAgentScreen(id, screen)}
             />
+            {#if shellPopup?.id === session.id}
+              <ShellPopup source={shellPopup} endpointLabel={viewModel.endpointLabel(shellPopup.endpoint)} fontSize={viewModel.fontSize} layoutRevision={terminalLayoutRevision} onFocus={() => viewModel.selectSession(session.id)} onClose={() => { if (shellPopup?.id === session.id) closeShellPopup(); }} />
+            {/if}
             {#if session.status !== 'running'}
               <div class="disconnected-banner" role="alert">
                 <span>Disconnected — {session.endpoint === 'local' ? 'the shell exited unexpectedly.' : `the connection to ${viewModel.endpointLabel(session.endpoint)} was lost.`}</span>
@@ -663,6 +689,7 @@
 {#if sessionMenu}
   <div class="session-context-menu" style={`left:${sessionMenu.x}px;top:${sessionMenu.y}px`} role="menu" tabindex="-1">
     <button role="menuitem" onclick={renameFromMenu}>Rename…</button>
+    <button role="menuitem" onclick={() => { if (sessionMenu) openShellPopup(sessionMenu.sessionId); }}>Open shell here</button>
   </div>
 {/if}
 

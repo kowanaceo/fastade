@@ -5,6 +5,8 @@ export interface CreateSessionInput {
   title: string;
   endpoint: string;
   projectPath: string;
+  /** A popup shell, excluded from saved sessions and the session grid. */
+  temporary?: boolean;
 }
 
 export interface SaveSessionInput {
