@@ -10,6 +10,7 @@ import type { SessionRecordRepository } from '../application/session-record-repo
 import { type AgentAccount, type AgentModelOption, type AgentUsage, type AuthUser, type CliKind, type CliSessionSummary, type CreateServerInput, type ManagedServer, type SavedSessionProfile, type SessionSummary, type SyncEntity, type SyncPushChange, type UpdateServerInput, type UsageSnapshot, type WebAgent } from '../domain/session';
 import { detectAgentActivity, type AgentActivity } from './activity-detector';
 import { detectAgentLaunch } from './agent-command';
+import { SessionSelectionHistory } from './session-navigation';
 
 type TerminalSink = (data: string, replay?: boolean) => void;
 
@@ -93,7 +94,18 @@ export class AppViewModel {
   sessions = $state<SessionSummary[]>([]);
   savedSessions = $state<SavedSessionProfile[]>([]);
   sshHosts = $state<SshHost[]>([]);
-  selectedSessionId = $state<string | null>(null);
+  private activeSessionId = $state<string | null>(null);
+  private sessionSelectionHistory = new SessionSelectionHistory();
+
+  get selectedSessionId(): string | null {
+    return this.activeSessionId;
+  }
+
+  set selectedSessionId(sessionId: string | null) {
+    if (sessionId === this.activeSessionId) return;
+    this.sessionSelectionHistory.record(sessionId);
+    this.activeSessionId = sessionId;
+  }
   selectedGroupId = $state<string>(UNGROUPED_ID);
   defaultGroupName = $state(DEFAULT_GROUP_NAME);
   groupDefinitions = $state<GroupDefinition[]>([]);
@@ -425,6 +437,15 @@ export class AppViewModel {
   selectSession(sessionId: string): void {
     this.selectedSessionId = sessionId;
     if (this.sessions.some((item) => item.id === sessionId)) this.selectedGroupId = this.groupForSession(sessionId);
+  }
+
+  previousSession(): string | null {
+    const sessionId = this.sessionSelectionHistory.previous(
+      this.selectedSessionId,
+      this.sessions.filter((session) => session.status === 'running').map((session) => session.id),
+    );
+    if (sessionId) this.selectSession(sessionId);
+    return sessionId;
   }
 
   /** Selects the next live session in the same top-to-bottom order used by

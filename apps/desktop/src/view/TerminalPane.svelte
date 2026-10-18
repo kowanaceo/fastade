@@ -21,6 +21,8 @@
   let fitRef: FitAddon | undefined;
   let scheduleFitRef: (() => void) | undefined;
 
+  const MIN_PTY_COLS = 20;
+  const MIN_PTY_ROWS = 4;
   const MOUSE_TRACKING_RESET = '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l';
 
   $: if (terminalRef && terminalRef.options.fontSize !== fontSize) {
@@ -147,7 +149,10 @@
       // A session can be visible in both the main window and a pop-out. Only
       // the focused window owns the live PTY size; otherwise two observers
       // continually overwrite each other with different rows and columns.
-      if (!document.hasFocus() || cols < 1 || rows < 1) return;
+      // Sizes this small only occur while the layout is still settling (grid
+      // split, fullscreen, hidden pane). Sending them makes the CLI wrap its
+      // output at a few columns, and that wrapping stays in scrollback forever.
+      if (!document.hasFocus() || cols < MIN_PTY_COLS || rows < MIN_PTY_ROWS) return;
       const size = `${cols}x${rows}`;
       if (size === lastSyncedSize) return;
       lastSyncedSize = size;
@@ -194,6 +199,7 @@
     let fitTimers: Array<ReturnType<typeof setTimeout>> = [];
     const fitAndRefresh = (): void => {
       try {
+        if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
         fit.fit();
         // xterm may have accepted its new geometry while the native window
         // briefly had no focus during a fullscreen/display transition. In

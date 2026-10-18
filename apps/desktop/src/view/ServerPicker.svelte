@@ -2,6 +2,7 @@
   import type { DesktopClient, SshHost } from '../application/desktop-client';
   import ServerQr from './ServerQr.svelte';
   import type { CreateServerInput, ManagedServer, UpdateServerInput } from '../domain/session';
+  import type { SshHostQr } from '../domain/server-qr';
 
   type AuthKind = 'password' | 'keyFile' | 'generateKey';
 
@@ -44,7 +45,24 @@
   let submitting = $state(false);
   let formError = $state<string | null>(null);
   let copied = $state(false);
-  let qrServer = $state<ManagedServer | null>(null);
+  type QrTarget = { kind: 'managed'; server: ManagedServer }
+    | { kind: 'ssh'; alias: string; server: SshHostQr | null; error: string };
+  let qrTarget = $state<QrTarget | null>(null);
+
+  async function toggleSshQr(alias: string): Promise<void> {
+    if (qrTarget?.kind === 'ssh' && qrTarget.alias === alias) {
+      qrTarget = null;
+      return;
+    }
+    qrTarget = { kind: 'ssh', alias, server: null, error: '' };
+    const pending = qrTarget;
+    try {
+      const server = await client.getSshHostQr(alias);
+      if (qrTarget === pending) qrTarget = { kind: 'ssh', alias, server, error: '' };
+    } catch (cause) {
+      if (qrTarget === pending) qrTarget = { kind: 'ssh', alias, server: null, error: cause instanceof Error ? cause.message : String(cause) };
+    }
+  }
 
   function resetForm(): void {
     editingId = null;
@@ -139,10 +157,28 @@
     <div class="server-columns">
       <section class="server-column" aria-label="~/.ssh/config">
         <p class="eyebrow">~/.ssh/config</p>
+        {#if qrTarget?.kind === 'ssh'}
+          {#key qrTarget.alias}
+            {@const target = qrTarget}
+            {#if target.server}
+              <ServerQr server={target.server} secretKind="key" loadCredentials={() => client.getSshHostQr(target.alias, true)} onClose={() => { qrTarget = null; }} />
+            {:else}
+              <div class="ssh-qr-state" role="status">
+                <span class:server-form-error={!!target.error}>{target.error || 'Loading QR code…'}</span>
+                <button class="icon-button" aria-label="Close QR code" onclick={() => { qrTarget = null; }}>×</button>
+              </div>
+            {/if}
+          {/key}
+        {/if}
         {#if sshHosts.length}
           <div class="server-list">
             {#each sshHosts as sshHost (sshHost.alias)}
-              <button class="server-row" onclick={() => onSelectSshHost(sshHost.alias)}>{sshHost.alias}</button>
+              <div class="server-row-wrap ssh-host-row">
+                <button class="server-row" title={sshHost.alias} onclick={() => onSelectSshHost(sshHost.alias)}>{sshHost.alias}</button>
+                <button class="server-edit" aria-label={`Show QR code for ${sshHost.alias}`} aria-expanded={qrTarget?.kind === 'ssh' && qrTarget.alias === sshHost.alias} title="QR code" onclick={() => void toggleSshQr(sshHost.alias)}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z" /></svg>
+                </button>
+              </div>
             {/each}
           </div>
         {:else}
@@ -190,7 +226,12 @@
             <div class="editor-actions wide"><button type="button" onclick={() => { showForm = false; resetForm(); }}>Cancel</button><button class="primary" type="submit" disabled={submitting}>{submitting ? 'Saving…' : editingId ? 'Save' : 'Create'}</button></div>
           </form>
         {/if}
-        {#if qrServer}<ServerQr server={qrServer} {client} onClose={() => { qrServer = null; }} />{/if}
+        {#if qrTarget?.kind === 'managed'}
+          {#key qrTarget.server.id}
+            {@const server = qrTarget.server}
+            <ServerQr {server} secretKind={server.auth.kind === 'password' ? 'password' : 'key'} loadCredentials={() => client.getServerQrCredentials(server.id)} onClose={() => { qrTarget = null; }} />
+          {/key}
+        {/if}
         {#if managedServers.length}
           <div class="server-list">
             {#each managedServers as server (server.id)}
@@ -198,7 +239,7 @@
                 <button class="server-row" onclick={() => onSelectManagedServer(server)}>
                   <strong>{server.name}</strong><small>{server.username}@{server.host}:{server.port} · {server.auth.kind === 'password' ? 'password' : 'key'}</small>
                 </button>
-                <button class="server-edit" aria-label={`Show QR code for ${server.name}`} title="QR code" onclick={(event) => { event.stopPropagation(); qrServer = qrServer?.id === server.id ? null : server; }}>
+                <button class="server-edit" aria-label={`Show QR code for ${server.name}`} aria-expanded={qrTarget?.kind === 'managed' && qrTarget.server.id === server.id} title="QR code" onclick={(event) => { event.stopPropagation(); qrTarget = qrTarget?.kind === 'managed' && qrTarget.server.id === server.id ? null : { kind: 'managed', server }; }}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z" /></svg>
                 </button>
                 <button class="server-edit" aria-label={`Edit ${server.name}`} title="Edit" onclick={(event) => { event.stopPropagation(); openEditForm(server); }}>

@@ -1,4 +1,5 @@
 import type { AgentAccount, AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
+import type { SshHostQr } from '../domain/server-qr';
 
 export interface CreateSessionInput {
   title: string;
@@ -37,6 +38,7 @@ export interface DesktopClient {
   setGroupLayout(layout: { defaultGroup: { name: string }; groups: { id: string; name: string }[]; sessions: Record<string, string>; profiles: Record<string, string> }): Promise<void>;
   replaceSavedSessions(profiles: SavedSessionProfile[]): Promise<void>;
   listSshHosts(): Promise<SshHost[]>;
+  getSshHostQr(alias: string, includeSecret?: boolean): Promise<SshHostQr>;
   listManagedServers(): Promise<ManagedServer[]>;
   createManagedServer(input: CreateServerInput): Promise<CreatedServer>;
   updateManagedServer(input: UpdateServerInput): Promise<CreatedServer>;

@@ -38,7 +38,7 @@ use session::{
     session_activity_overrides, session_memory_usage, terminal_snapshot, update_session_agent,
     update_session_context, upload_file_to_session, write_terminal, AppState,
 };
-use ssh_config::list_ssh_hosts;
+use ssh_config::{get_ssh_host_qr, list_ssh_hosts};
 use usage::{get_agent_usage, get_local_accounts, get_remote_usage};
 use windows::{
     fit_window_after_resize, fit_windows_after_display_change, open_session_window,
@@ -86,6 +86,7 @@ pub fn run() {
             reconnect_session,
             close_session,
             list_ssh_hosts,
+            get_ssh_host_qr,
             list_remote_directory,
             list_managed_servers,
             create_managed_server,

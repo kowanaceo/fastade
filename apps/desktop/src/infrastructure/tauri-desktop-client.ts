@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { CreateSessionInput, DesktopClient, RemoteDirectoryListing, SaveSessionInput, SshHost, TerminalEvent } from '../application/desktop-client';
 import type { AgentAccount, AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
+import type { SshHostQr } from '../domain/server-qr';
 
 export class TauriDesktopClient implements DesktopClient {
   listSessions(): Promise<CliSessionSummary[]> {
@@ -39,6 +40,10 @@ export class TauriDesktopClient implements DesktopClient {
 
   listSshHosts(): Promise<SshHost[]> {
     return invoke<SshHost[]>('list_ssh_hosts');
+  }
+
+  getSshHostQr(alias: string, includeSecret = false): Promise<SshHostQr> {
+    return invoke<SshHostQr>('get_ssh_host_qr', { alias, includeSecret });
   }
 
   listRemoteDirectory(endpoint: string, path: string): Promise<RemoteDirectoryListing> {

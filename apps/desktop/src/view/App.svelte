@@ -129,10 +129,11 @@
       else viewModel.increaseFontSize();
       return;
     }
-    if (!poppedSessionId && event.ctrlKey && event.key === 'Tab') {
+    if (!poppedSessionId && event.key === 'Tab' && !event.metaKey && event.ctrlKey !== event.altKey) {
       event.preventDefault();
       event.stopImmediatePropagation();
-      const sessionId = viewModel.cycleSession(event.shiftKey);
+      if (event.ctrlKey && event.repeat) return;
+      const sessionId = event.ctrlKey ? viewModel.previousSession() : viewModel.cycleSession(event.shiftKey);
       if (sessionId) void focusTerminal(sessionId);
       return;
     }
@@ -260,13 +261,16 @@
   const connectedCount = $derived(viewModel.sessionGroups.reduce((sum, group) => sum + group.entries.filter((entry) => entry.status === 'running').length, 0));
   const totalEntries = $derived(viewModel.sessionGroups.reduce((sum, group) => sum + group.entries.length, 0));
   const connectedGroupIds = $derived(viewModel.sessionGroups.filter((group) => group.entries.some((entry) => entry.status === 'running')).map((group) => group.id));
-  const connectedExpanded = $derived(connectedGroupIds.length > 0 && connectedGroupIds.every((id) => !isGroupCollapsed(id)));
+  const connectedExpanded = $derived(connectedGroupIds.length > 0 && viewModel.sessionGroups.every((group) =>
+    connectedGroupIds.includes(group.id) ? !isGroupCollapsed(group.id) : isGroupCollapsed(group.id),
+  ));
 
-  /** Expand every group that holds a connected session, or collapse them all
-   * again when they are already open. */
+  /** Show only groups with connected sessions; click again to collapse all. */
   function toggleConnectedGroups(): void {
     const collapse = connectedExpanded;
-    collapsedGroups = { ...collapsedGroups, ...Object.fromEntries(connectedGroupIds.map((id) => [id, collapse])) };
+    collapsedGroups = { ...collapsedGroups, ...Object.fromEntries(viewModel.sessionGroups.map((group) =>
+      [group.id, collapse || !connectedGroupIds.includes(group.id)],
+    )) };
   }
 
   function handleGlobalContextMenu(event: MouseEvent): void {
@@ -442,16 +446,17 @@
           {/if}
         </section>
       {/if}
-      <nav aria-label="Group list">
+      <nav class="group-nav" aria-label="Group list">
         <form class="new-group" onsubmit={(event) => { event.preventDefault(); viewModel.createGroup(); }}>
           <input bind:value={viewModel.draftGroupName} aria-label="New group name" placeholder="New group" />
           <button type="submit" aria-label="Add group" title="Add group">+</button>
         </form>
         <div class="list-heading">
           <p class="eyebrow">GROUPS · {viewModel.sessionGroups.length - 1}</p>
-          <button class="eyebrow sessions-toggle" disabled={!connectedGroupIds.length} aria-pressed={connectedExpanded} title={connectedExpanded ? 'Collapse groups with connected sessions' : 'Expand every group with connected sessions'} onclick={toggleConnectedGroups}>SESSIONS · {connectedCount}/{totalEntries}</button>
+          <button class="eyebrow sessions-toggle" disabled={!connectedGroupIds.length} aria-pressed={connectedExpanded} title={connectedExpanded ? 'Collapse all groups' : 'Show only groups with connected sessions'} onclick={toggleConnectedGroups}>SESSIONS · {connectedCount}/{totalEntries}</button>
         </div>
         <input class="group-search" type="search" bind:value={groupQuery} aria-label="Search groups and sessions" placeholder="Search" />
+        <div class="group-list">
         {#each visibleGroups as group (group.id)}
           {@const groupTasks = [...new Set(group.entries.flatMap((entry) => entry.profileId ?? []))].reduce((sum, id) => sum + (openTaskCounts[id] ?? 0), 0)}
           <section
@@ -543,6 +548,7 @@
             {/if}
           </section>
         {/each}
+        </div>
       </nav>
     </aside>
   {/if}
