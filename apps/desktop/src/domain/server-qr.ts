@@ -2,6 +2,10 @@ import type { ManagedServer } from './session.ts';
 
 export const SERVER_QR_SCHEME = 'aissh://add-server';
 
+export type ServerQrConnection = Pick<ManagedServer, 'name' | 'host' | 'port' | 'username'>;
+
+export interface SshHostQr extends ServerQrConnection, ServerQrCredentials {}
+
 export interface ServerQrCredentials {
   password?: string | null;
   /** OpenSSH private key, base64url encoded. */
@@ -12,7 +16,7 @@ export interface ServerQrCredentials {
  * parameter names (`host`, `user`) are what the app's parser requires. Secrets
  * are included only when the caller passes them explicitly. */
 export function serverQrPayload(
-  server: Pick<ManagedServer, 'name' | 'host' | 'port' | 'username'>,
+  server: ServerQrConnection,
   credentials: ServerQrCredentials = {},
 ): string {
   const query = new URLSearchParams({
