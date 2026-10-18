@@ -113,3 +113,5 @@ button.upload:has(.records-icon) { position: relative; }
 .server-row-wrap.ssh-host-row { grid-template-columns: minmax(0, 1fr) 22px; }
 .ssh-qr-state { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px; color: #87948b; font-size: 10px; overflow-wrap: anywhere; }
 @media (max-width: 620px) { .server-columns { grid-template-columns: minmax(0, 1fr); overflow: auto; }.server-column { overflow: visible; }.server-divider { height: 1px; } }
+
+.session-identity .shell-popup-button { white-space: nowrap; }
