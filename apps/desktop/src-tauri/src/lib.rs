@@ -9,6 +9,7 @@ mod saved_sessions;
 mod servers;
 mod session;
 mod ssh_config;
+mod stt;
 mod usage;
 mod windows;
 
@@ -20,8 +21,8 @@ use auth::{
 use mcp_settings::{mcp_agent_status, set_mcp_agent_enabled};
 use model_metadata::{list_agent_models, refresh_session_agent_metadata};
 use records::{
-    create_session_record, delete_session_record, list_all_session_records, list_session_records,
-    replace_session_records, update_session_record,
+    claim_todo_tasks, create_session_record, delete_session_record, list_all_session_records,
+    list_session_records, replace_session_records, restore_claimed_tasks, update_session_record,
 };
 use remote_fs::list_remote_directory;
 use saved_sessions::{
@@ -48,6 +49,7 @@ use windows::{
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(stt::VoiceRequests::default())
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| match event {
             // Moving to a screen with a different scale is part of a display
@@ -111,12 +113,16 @@ pub fn run() {
             google_auth_status,
             google_sign_in,
             google_sign_out,
+            stt::transcribe_voice,
+            stt::cancel_voice_transcription,
             sync_snapshot,
             sync_changes,
             sync_push,
             list_session_records,
             create_session_record,
             update_session_record,
+            claim_todo_tasks,
+            restore_claimed_tasks,
             delete_session_record,
             list_all_session_records,
             replace_session_records

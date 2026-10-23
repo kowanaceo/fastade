@@ -113,10 +113,10 @@
   });
 </script>
 
-<div class="shell-popup" data-shell-popup role="dialog" aria-label={`Shell for ${source.title}`} tabindex="-1" onkeydown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); void close(); } }} oncontextmenu={(event) => event.stopPropagation()}>
+<div class="shell-popup" data-shell-popup role="dialog" aria-label={`Shell for ${source.title}`} tabindex="-1" oncontextmenu={(event) => event.stopPropagation()}>
   <header>
     <div><strong>Shell · {source.title}</strong><small>{endpointLabel} · {source.projectPath}</small></div>
-    <button type="button" aria-label="Close shell" title="Close shell (Esc)" disabled={closing} onclick={() => void close()}>×</button>
+    <button type="button" aria-label="Close shell" title="Close shell" disabled={closing} onclick={() => void close()}>×</button>
   </header>
   {#if error}<div class="popup-error" role="alert">{error}</div>{/if}
   <div class="popup-terminal">
@@ -128,7 +128,7 @@
         {registerOutput}
         onInput={write}
         onResize={(id, cols, rows) => void resize(id, cols, rows)}
-        onInterrupt={() => void close()}
+        onInterrupt={(id) => write(id, '\x1b')}
         onFocus={() => onFocus()}
         onCurrentDirectory={() => {}}
         onActivityScreen={() => {}}

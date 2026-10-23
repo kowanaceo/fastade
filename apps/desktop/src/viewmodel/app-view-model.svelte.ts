@@ -1,5 +1,5 @@
 import type { DesktopClient, SshHost, TerminalEvent } from '../application/desktop-client';
-import { localHostId, localSnapshot, mergeHostUsage, parseSnapshotList, shouldUpload, windowsKey } from '../domain/usage-snapshots';
+import { localHostId, localSnapshot, mergeHostUsage, parseSnapshotList, shouldUpload, snapshotKey } from '../domain/usage-snapshots';
 import { syncSessionRecords } from '../application/session-record-sync';
 import {
   activeGroupEntities, defaultNameFromEntity, groupEntityId, groupSyncStateFrom, groupsFromEntities, planGroupChanges,
@@ -11,6 +11,9 @@ import { type AgentAccount, type AgentModelOption, type AgentUsage, type AuthUse
 import { detectAgentActivity, type AgentActivity } from './activity-detector';
 import { detectAgentLaunch } from './agent-command';
 import { SessionSelectionHistory } from './session-navigation';
+import { voiceTerminalInput } from '../domain/voice-input';
+import { executeSessionTasks } from '../application/task-execution';
+import { taskAgentCommand } from '../domain/task-execution';
 
 type TerminalSink = (data: string, replay?: boolean) => void;
 
@@ -129,9 +132,11 @@ export class AppViewModel {
   recordsRevision = $state(0);
   webAgents = $state<WebAgent[]>(DEFAULT_WEB_AGENTS.map((agent) => ({ ...agent })));
   agentUsage = $state<Record<string, AgentUsage>>({});
+  usageRefreshing = $state(false);
+  private usageRefreshGeneration = 0;
   /** Other SSH hosts and devices, newest snapshot per agent and host. */
   hostUsage = $state<UsageSnapshot[]>([]);
-  private usageUploads = new Map<string, { key: string; at: number }>();
+  private usageUploads = new Map<string, { key: string; at: number; collectedAt: number }>();
   agentDefaultModels = $state<Record<CliKind, string>>({ codex: '', claude: '', gemini: '' });
   agentModels = $state<Record<CliKind, AgentModelOption[]>>({ codex: [], claude: [], gemini: [] });
   /** Whether that CLI's own MCP config currently registers fastade's
@@ -201,6 +206,7 @@ export class AppViewModel {
   private unsubscribeRecords?: () => void;
   private readonly terminalSinks = new Map<string, Set<TerminalSink>>();
   private readonly terminalWrites = new Map<string, Promise<void>>();
+  private readonly taskDispatches = new Set<string>();
   private readonly hookInstalledSessionIds = new Set<string>();
   /** First directory each shell reported after opening at `~` — the device's
    * real home path (e.g. /root), so it can be told apart from a chosen folder. */
@@ -515,18 +521,27 @@ export class AppViewModel {
     this.persistWebAgents();
   }
 
-  /** `force` is the refresh button: it also bypasses the cache of Claude's
-   * slow-to-read limits. The timer leaves that cache alone. */
+  /** Manual refresh bypasses each agent's cache. Publish each result as it
+   * arrives, so a slow collector cannot hold up the other agent's limits. */
   async refreshAgentUsage(force = false): Promise<void> {
+    if (this.usageRefreshing && !force) return;
+    const generation = ++this.usageRefreshGeneration;
+    this.usageRefreshing = true;
     const enabled = this.webAgents.filter((agent) => agent.enabled);
-    const entries = await Promise.all(enabled.map(async (agent): Promise<[string, AgentUsage]> => {
-      try { return [agent.id, await this.client.getAgentUsage(agent.id, force)]; }
-      catch (error) {
-        return [agent.id, { agentId: agent.id, status: 'error', windows: [], message: this.message(error) }];
-      }
-    }));
-    this.agentUsage = Object.fromEntries(entries);
-    await this.refreshHostUsage(force);
+    try {
+      await Promise.all(enabled.map(async (agent) => {
+        let usage: AgentUsage;
+        try { usage = await this.client.getAgentUsage(agent.id, force); }
+        catch (error) {
+          usage = { agentId: agent.id, status: 'error', windows: [], message: this.message(error) };
+        }
+        if (generation !== this.usageRefreshGeneration || !this.webAgents.some((item) => item.id === agent.id && item.enabled)) return;
+        this.agentUsage = { ...this.agentUsage, [agent.id]: usage };
+      }));
+      if (generation === this.usageRefreshGeneration) await this.refreshHostUsage(force);
+    } finally {
+      if (generation === this.usageRefreshGeneration) this.usageRefreshing = false;
+    }
   }
 
   /** Adds what this device cannot see itself: SSH hosts with a live session
@@ -538,16 +553,15 @@ export class AppViewModel {
     try { remote = await this.client.getRemoteUsage(force); } catch { /* no live ssh session, or the host is unreachable */ }
     let accounts: AgentAccount[] = [];
     try { accounts = await this.client.getLocalAccounts(); } catch { /* no signed-in CLI */ }
-    const accountOf = (agentId: string) => accounts.find((account) => account.agentId === agentId)?.accountId;
     let shared: UsageSnapshot[] = [];
-    const local = Object.entries(this.agentUsage).flatMap(([id, usage]) => localSnapshot(id, usage, this.authDeviceId, now, accountOf(id)) ?? []);
+    const local = Object.entries(this.agentUsage).flatMap(([id, usage]) => localSnapshot(id, usage, this.authDeviceId) ?? []);
     if (this.authUser && this.authDeviceId) {
       try {
         for (const snapshot of [...local, ...remote]) {
-          const key = `${snapshot.agentId}\n${snapshot.hostId}`;
+          const key = `${snapshot.agentId}\n${snapshot.hostId}\n${snapshot.accountId ?? ''}`;
           if (!shouldUpload(this.usageUploads.get(key), snapshot, now)) continue;
           await this.client.putUsageSnapshot(snapshot);
-          this.usageUploads.set(key, { key: windowsKey(snapshot.windows), at: now });
+          this.usageUploads.set(key, { key: snapshotKey(snapshot), at: now, collectedAt: snapshot.collectedAt });
         }
         shared = parseSnapshotList(await this.client.listUsageSnapshots());
       } catch { /* usage sync is optional: keep showing the local view */ }
@@ -1061,8 +1075,67 @@ export class AppViewModel {
     };
   }
 
-  async writeTerminal(sessionId: string, data: string): Promise<void> {
-    if (this.sessions.find((session) => session.id === sessionId)?.status !== 'running') return;
+  async sendVoiceInput(sessionId: string, text: string): Promise<void> {
+    if (!this.authenticated) throw new Error('auth');
+    await this.writeTerminal(sessionId, voiceTerminalInput(text), true);
+  }
+
+  taskRunUnavailable(sessionId: string): string {
+    const session = this.sessions.find((item) => item.id === sessionId);
+    if (session?.status !== 'running') return 'Reconnect this session before running tasks.';
+    if (this.isAgentRunning(sessionId)) {
+      if (this.activityFor(sessionId) !== 'idle') return 'Wait until the AI agent is Ready before running tasks.';
+    } else if (!this.availableAgents.length) {
+      return 'Enable an AI agent in Settings before running tasks.';
+    }
+    return '';
+  }
+
+  async runTasks(sessionId: string, profileId: string, taskIds?: string[]): Promise<void> {
+    if (this.taskDispatches.has(sessionId)) throw new Error('Tasks are already being sent to this session.');
+    const validateTarget = (): SessionSummary => {
+      const reason = this.taskRunUnavailable(sessionId);
+      if (reason) throw new Error(reason);
+      const session = this.sessions.find((item) => item.id === sessionId)!;
+      if (this.profileForSession(session)?.id !== profileId) throw new Error('This session no longer matches these tasks.');
+      return session;
+    };
+    validateTarget();
+    this.taskDispatches.add(sessionId);
+    try {
+      await executeSessionTasks(this.recordStore, profileId, taskIds, async (prompt) => {
+        const session = validateTarget();
+        const runningCli = this.runningAgents[sessionId];
+        let input = prompt;
+        if (!runningCli) {
+          const recent = this.availableAgents.filter((cli) => session.lastModels?.[cli])
+            .sort((a, b) => (Date.parse(session.lastModels?.[b]?.detectedAt ?? '') || 0) - (Date.parse(session.lastModels?.[a]?.detectedAt ?? '') || 0));
+          const cli = recent[0] ?? this.availableAgents[0];
+          const model = this.agentDefaultModels[cli] || undefined;
+          input = taskAgentCommand(cli, prompt, model);
+          await this.markAgentRunning(sessionId, cli, model);
+        }
+        try {
+          // One queued write keeps other input out from between the request and Enter.
+          await this.writeTerminal(sessionId, `${input}\r`, true);
+        } catch {
+          if (!runningCli) this.markAgentExited(sessionId);
+          throw new Error('Could not send tasks. Check the terminal before retrying; it may have received part of the input.');
+        }
+        this.selectSession(sessionId);
+      });
+    } finally {
+      this.taskDispatches.delete(sessionId);
+      this.recordsRevision += 1;
+      this.requestSync();
+    }
+  }
+
+  async writeTerminal(sessionId: string, data: string, reportFailure = false): Promise<void> {
+    if (this.sessions.find((session) => session.id === sessionId)?.status !== 'running') {
+      if (reportFailure) throw new Error('session');
+      return;
+    }
     // The clearest start-of-turn signal is the user's submit itself. This is
     // especially useful for Codex, whose full-screen TUI can redraw the idle
     // composer before its first busy frame arrives.
@@ -1081,6 +1154,7 @@ export class AppViewModel {
       await write;
     } catch (error) {
       this.error = this.message(error);
+      if (reportFailure) throw new Error('send');
     } finally {
       if (this.terminalWrites.get(sessionId) === write) this.terminalWrites.delete(sessionId);
     }

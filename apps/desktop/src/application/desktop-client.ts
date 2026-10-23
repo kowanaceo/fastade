@@ -83,6 +83,7 @@ export interface DesktopClient {
   googleAuthStatus(): Promise<AuthStatus>;
   googleSignIn(): Promise<AuthUser>;
   googleSignOut(): Promise<void>;
+  transcribeVoice(audio: Blob, language: '' | 'ko' | 'en', signal: AbortSignal): Promise<string>;
   syncSnapshot(): Promise<SyncSnapshot>;
   syncChanges(cursor: number, limit?: number, waitSeconds?: number): Promise<SyncChangesResponse>;
   syncPush(changes: SyncPushChange[]): Promise<SyncPushResponse>;

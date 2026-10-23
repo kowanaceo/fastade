@@ -82,7 +82,9 @@ where
     match value {
         serde_json::Value::String(value) => Ok(value),
         serde_json::Value::Number(value) => Ok(value.to_string()),
-        _ => Err(serde::de::Error::custom("user id must be a string or number")),
+        _ => Err(serde::de::Error::custom(
+            "user id must be a string or number",
+        )),
     }
 }
 
@@ -388,6 +390,69 @@ async fn authenticated_get(path: &str) -> Result<serde_json::Value, String> {
             .map_err(|error| format!("Could not reach the fastade server: {error}"))?;
     }
     response_json(response, "Fastade sync failed").await
+}
+
+/// Credentials stay in the Keychain/Rust layer; neither audio nor text is persisted.
+pub(crate) async fn transcribe_voice_audio(
+    audio: Vec<u8>,
+    mime_type: &str,
+    language: &str,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(90))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "network".to_owned())?;
+    let mut session = read_session().ok_or_else(|| "auth".to_owned())?;
+    for attempt in 0..2 {
+        let response = client
+            .post(format!("{BACKEND_BASE_URL}/stt/transcribe"))
+            .bearer_auth(&session.access_token)
+            .multipart(crate::stt::audio_form(audio.clone(), mime_type, language)?)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "network"
+                }
+                .to_owned()
+            })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            session = refresh_session_if_needed(&client, session)
+                .await
+                .map_err(|_| "auth".to_owned())?;
+            continue;
+        }
+        if !status.is_success() {
+            // Do not expose arbitrary upstream bodies or audio/text in errors or logs.
+            return Err(match status.as_u16() {
+                401 | 403 => "auth",
+                404 | 405 | 501 => "unavailable",
+                413 => "too_large",
+                415 => "unsupported",
+                400 | 422 => "invalid_audio",
+                429 => "rate_limit",
+                502 | 503 | 504 => "service",
+                _ => "server",
+            }
+            .to_owned());
+        }
+        let body: serde_json::Value = response.json().await.map_err(|_| "response".to_owned())?;
+        let text = body
+            .get("text")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "response".to_owned())?
+            .trim();
+        if text.is_empty() {
+            return Err("empty_text".into());
+        }
+        return Ok(text.to_owned());
+    }
+    Err("auth".into())
 }
 
 async fn authenticated_post(

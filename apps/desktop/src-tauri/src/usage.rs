@@ -16,13 +16,17 @@ use crate::session::{most_recent_local_path, resolve_program, AppState};
 /// good result is reused for this long unless the user presses refresh.
 const CLAUDE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 static CLAUDE_CACHE: Mutex<Option<(Instant, AgentUsage)>> = Mutex::new(None);
+const CODEX_LOG_MAX_AGE_SECONDS: i64 = 5 * 60;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageWindow {
     label: String,
     remaining_percent: i64,
+    /// Absolute Unix epoch seconds, never milliseconds. Past instants are kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
     resets_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reset_text: Option<String>,
 }
 
@@ -33,6 +37,14 @@ pub struct AgentUsage {
     status: &'static str,
     windows: Vec<UsageWindow>,
     message: Option<String>,
+    /// Provider event time for logs, response receipt time for live queries.
+    /// Reading a cached result never changes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collected_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_email: Option<String>,
 }
 
 #[tauri::command]
@@ -42,8 +54,9 @@ pub async fn get_agent_usage(
     state: tauri::State<'_, AppState>,
 ) -> Result<AgentUsage, String> {
     let requested_id = agent_id.clone();
+    let account = local_account(&requested_id);
     if requested_id == "claude" && !force.unwrap_or(false) {
-        if let Some(cached) = fresh_claude_cache() {
+        if let Some(cached) = fresh_claude_cache(account.as_ref()) {
             return Ok(cached);
         }
     }
@@ -55,46 +68,91 @@ pub async fn get_agent_usage(
     // inherited working directory, which made this fail far more often than
     // the equivalent Codex lookup.
     let claude_cwd = most_recent_local_path(&state);
-    tauri::async_runtime::spawn_blocking(move || match requested_id.as_str() {
-        "codex" => fetch_codex_usage(),
-        "claude" => fetch_claude_usage(claude_cwd).map(|usage| {
-            if usage.status == "available" {
-                if let Ok(mut cache) = CLAUDE_CACHE.lock() {
-                    *cache = Some((Instant::now(), usage.clone()));
-                }
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut usage = match requested_id.as_str() {
+            "codex" => fetch_codex_usage(force.unwrap_or(false)),
+            "claude" => fetch_claude_usage(claude_cwd),
+            _ => Ok(AgentUsage {
+                agent_id: requested_id.clone(),
+                status: "unavailable",
+                windows: Vec::new(),
+                message: Some("Check the Usage page.".to_owned()),
+                collected_at: None,
+                account_id: None,
+                account_email: None,
+            }),
+        }?;
+        // Never attach a newly signed-in account to limits collected before
+        // the account switch. The next refresh will collect that account.
+        if account != local_account(&requested_id) {
+            return Err("Agent account changed during usage collection; refresh again.".to_owned());
+        }
+        usage.account_id = account.as_ref().map(|a| a.account_id.clone());
+        usage.account_email = account.and_then(|a| a.label);
+        if requested_id == "claude" && usage.status == "available" {
+            if let Ok(mut cache) = CLAUDE_CACHE.lock() {
+                *cache = Some((Instant::now(), usage.clone()));
             }
-            usage
-        }),
-        _ => Ok(AgentUsage {
-            agent_id: requested_id,
-            status: "unavailable",
-            windows: Vec::new(),
-            message: Some("Check the Usage page.".to_owned()),
-        }),
+        }
+        Ok(usage)
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
-fn fresh_claude_cache() -> Option<AgentUsage> {
+fn fresh_claude_cache(account: Option<&AgentAccount>) -> Option<AgentUsage> {
     let cache = CLAUDE_CACHE.lock().ok()?;
     let (at, usage) = cache.as_ref()?;
-    (at.elapsed() < CLAUDE_CACHE_TTL).then(|| usage.clone())
+    let reset = usage
+        .windows
+        .iter()
+        .any(|window| window.resets_at.is_some_and(|at| at <= now_unix()));
+    (at.elapsed() < CLAUDE_CACHE_TTL
+        && usage.account_id.as_deref() == account.map(|a| a.account_id.as_str())
+        && usage.account_email.as_deref() == account.and_then(|a| a.label.as_deref())
+        && !reset)
+        .then(|| usage.clone())
 }
 
-/// Codex records its rate limits in every session log it writes, so the
-/// newest log already holds the answer; only when there is none (or it
-/// describes a window that has since reset) is the app-server started.
-fn fetch_codex_usage() -> Result<AgentUsage, String> {
-    if let Some((windows, _)) = codex_log_usage(&codex_sessions_dir()) {
-        return Ok(AgentUsage {
-            agent_id: "codex".to_owned(),
-            status: "available",
-            windows,
-            message: None,
-        });
+/// Logs are a short-lived cache. A manual refresh always asks the account,
+/// including when this device has not run a new Codex turn recently.
+fn fetch_codex_usage(force: bool) -> Result<AgentUsage, String> {
+    codex_usage_with_refresh(
+        &codex_sessions_dir(),
+        force,
+        now_unix(),
+        fetch_codex_usage_from_app_server,
+    )
+}
+
+fn codex_usage_with_refresh(
+    root: &Path,
+    force: bool,
+    now: i64,
+    fetch_live: impl FnOnce() -> Result<AgentUsage, String>,
+) -> Result<AgentUsage, String> {
+    if !force {
+        if let Some((windows, written)) = codex_log_usage(root) {
+            // A missing window may have reset since the log was written.
+            if (0..CODEX_LOG_MAX_AGE_SECONDS).contains(&(now - written))
+                && windows.len() == 2
+                && !windows
+                    .iter()
+                    .any(|window| window.resets_at.is_some_and(|at| at <= now))
+            {
+                return Ok(AgentUsage {
+                    agent_id: "codex".to_owned(),
+                    status: "available",
+                    windows,
+                    message: None,
+                    collected_at: Some(written),
+                    account_id: None,
+                    account_email: None,
+                });
+            }
+        }
     }
-    fetch_codex_usage_from_app_server()
+    fetch_live()
 }
 
 fn codex_sessions_dir() -> PathBuf {
@@ -105,9 +163,8 @@ fn codex_sessions_dir() -> PathBuf {
         .join("sessions")
 }
 
-/// Newest `rollout-*.jsonl` files first. Logs live in `YYYY/MM/DD/`, so
-/// walking the directory names in descending order finds them without
-/// reading the whole history.
+/// Most recently modified `rollout-*.jsonl` files first. An older session
+/// can still be active after a newer one has stopped writing.
 fn newest_rollouts(root: &Path, limit: usize) -> Vec<PathBuf> {
     fn descending(path: &Path) -> Vec<PathBuf> {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
@@ -125,14 +182,18 @@ fn newest_rollouts(root: &Path, limit: usize) -> Vec<PathBuf> {
                     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     if name.starts_with("rollout-") && name.ends_with(".jsonl") {
                         files.push(file);
-                        if files.len() >= limit {
-                            return files;
-                        }
                     }
                 }
             }
         }
     }
+    files.sort_by_cached_key(|path| {
+        std::cmp::Reverse((
+            path.metadata().ok().and_then(|meta| meta.modified().ok()),
+            path.clone(),
+        ))
+    });
+    files.truncate(limit);
     files
 }
 
@@ -140,7 +201,8 @@ fn read_tail(path: &Path, bytes: u64) -> Option<String> {
     use std::io::{Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(length.saturating_sub(bytes))).ok()?;
+    file.seek(SeekFrom::Start(length.saturating_sub(bytes)))
+        .ok()?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).ok()?;
     Some(String::from_utf8_lossy(&contents).into_owned())
@@ -150,14 +212,14 @@ fn codex_log_usage(root: &Path) -> Option<(Vec<UsageWindow>, i64)> {
     newest_rollouts(root, 8)
         .iter()
         .filter_map(|path| read_tail(path, 256 * 1024))
-        .find_map(|tail| codex_usage_from_log(&tail, now_unix()))
+        .filter_map(|tail| codex_usage_from_log(&tail))
+        .max_by_key(|(_, written)| *written)
 }
 
 /// The last `token_count` event's rate limits in `text` (a log tail, or the
 /// one line a remote host sends back), as windows plus when it was written.
-/// A window whose reset time has passed is dropped: its percentage describes
-/// a window that no longer exists.
-fn codex_usage_from_log(text: &str, now: i64) -> Option<(Vec<UsageWindow>, i64)> {
+/// Expired reset instants are preserved so consumers can identify stale limits.
+fn codex_usage_from_log(text: &str) -> Option<(Vec<UsageWindow>, i64)> {
     let event = text.lines().rev().find_map(|line| {
         if !line.contains("\"rate_limits\"") {
             return None;
@@ -167,34 +229,33 @@ fn codex_usage_from_log(text: &str, now: i64) -> Option<(Vec<UsageWindow>, i64)>
             && value.pointer("/payload/rate_limits/primary").is_some())
         .then_some(value)
     })?;
+    let written = written_at(&event)?;
     let limits = event.pointer("/payload/rate_limits")?;
     let mut windows = Vec::new();
     for (label, key) in [("5h", "primary"), ("Week", "secondary")] {
         let value = &limits[key];
         let used = value.get("used_percent").and_then(Value::as_f64);
-        let resets_at = value.get("resets_at").and_then(Value::as_i64);
-        let (Some(used), Some(resets_at)) = (used, resets_at) else {
+        let Some(used) = used else {
             continue;
         };
-        if resets_at <= now {
-            continue;
-        }
+        let (resets_at, reset_text) = reset_fields(value, "resets_at", "reset_text", written);
         windows.push(UsageWindow {
             label: label.to_owned(),
             remaining_percent: (100.0 - used).round().clamp(0.0, 100.0) as i64,
-            resets_at: Some(resets_at),
-            reset_text: None,
+            resets_at,
+            reset_text,
         });
     }
     if windows.is_empty() {
         return None;
     }
-    let written = event
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-        .map_or(now, |stamp| stamp.timestamp());
     Some((windows, written))
+}
+
+fn written_at(event: &Value) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(event.get("timestamp")?.as_str()?)
+        .ok()
+        .map(|at| at.timestamp())
 }
 
 fn fetch_codex_usage_from_app_server() -> Result<AgentUsage, String> {
@@ -234,6 +295,7 @@ fn fetch_codex_usage_from_app_server() -> Result<AgentUsage, String> {
         let _ = sender.send(result);
     });
     let received = receiver.recv_timeout(Duration::from_secs(12));
+    let collected_at = now_unix();
     let _ = child.kill();
     let _ = child.wait();
     let result = received.map_err(|_| "Codex usage lookup timed out.".to_owned())?;
@@ -242,8 +304,8 @@ fn fetch_codex_usage_from_app_server() -> Result<AgentUsage, String> {
         .ok_or_else(|| "Did not receive a Codex usage response.".to_owned())?;
     let limits = &result["rateLimits"];
     let mut windows = Vec::new();
-    append_window(&mut windows, "5h", &limits["primary"]);
-    append_window(&mut windows, "Week", &limits["secondary"]);
+    append_window(&mut windows, "5h", &limits["primary"], collected_at);
+    append_window(&mut windows, "Week", &limits["secondary"], collected_at);
     Ok(AgentUsage {
         agent_id: "codex".to_owned(),
         status: if windows.is_empty() {
@@ -253,19 +315,57 @@ fn fetch_codex_usage_from_app_server() -> Result<AgentUsage, String> {
         },
         windows,
         message: None,
+        collected_at: Some(collected_at),
+        account_id: None,
+        account_email: None,
     })
 }
 
-fn append_window(windows: &mut Vec<UsageWindow>, label: &str, value: &Value) {
-    let Some(used_percent) = value.get("usedPercent").and_then(Value::as_i64) else {
+fn append_window(windows: &mut Vec<UsageWindow>, label: &str, value: &Value, collected_at: i64) {
+    let Some(used_percent) = value.get("usedPercent").and_then(Value::as_f64) else {
         return;
     };
+    let (resets_at, reset_text) = reset_fields(value, "resetsAt", "resetText", collected_at);
     windows.push(UsageWindow {
         label: label.to_owned(),
-        remaining_percent: (100 - used_percent).clamp(0, 100),
-        resets_at: value.get("resetsAt").and_then(Value::as_i64),
-        reset_text: None,
+        remaining_percent: (100.0 - used_percent).round().clamp(0.0, 100.0) as i64,
+        resets_at,
+        reset_text,
     });
+}
+
+fn reset_fields(
+    value: &Value,
+    instant_key: &str,
+    text_key: &str,
+    collected_at: i64,
+) -> (Option<i64>, Option<String>) {
+    let text = value
+        .get(text_key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty());
+    let instant = value
+        .get(instant_key)
+        .and_then(Value::as_f64)
+        .filter(|at| at.is_finite() && *at >= 0.0 && *at < i64::MAX as f64)
+        // Be defensive about millisecond timestamps from a provider adapter.
+        .map(|at| {
+            (if at >= 1_000_000_000_000.0 {
+                at / 1000.0
+            } else {
+                at
+            })
+            .floor() as i64
+        })
+        .or_else(|| text.and_then(|text| parse_reset_instant(text, collected_at)));
+    (
+        instant,
+        if instant.is_some() {
+            None
+        } else {
+            text.map(str::to_owned)
+        },
+    )
 }
 
 fn fetch_claude_usage(cwd: Option<String>) -> Result<AgentUsage, String> {
@@ -342,6 +442,9 @@ fn fetch_claude_usage(cwd: Option<String>) -> Result<AgentUsage, String> {
             message: Some(
                 "Claude Code has not trusted this folder yet. Run claude once in a terminal to complete the trust prompt, then try again.".to_owned(),
             ),
+            collected_at: None,
+            account_id: None,
+            account_email: None,
         });
     }
 
@@ -373,6 +476,7 @@ fn fetch_claude_usage(cwd: Option<String>) -> Result<AgentUsage, String> {
     });
     // The second window's percentage can land a beat after the first one does.
     thread::sleep(Duration::from_millis(300));
+    let collected_at = now_unix();
 
     let _ = child.kill();
     let _ = child.wait();
@@ -386,7 +490,7 @@ fn fetch_claude_usage(cwd: Option<String>) -> Result<AgentUsage, String> {
     if std::env::var("FASTADE_DEBUG_USAGE").is_ok() {
         eprintln!("RAW CLAUDE USAGE TEXT:\n{text}");
     }
-    Ok(parse_claude_usage(&text))
+    Ok(parse_claude_usage_at(&text, collected_at))
 }
 
 fn current_output(output: &Arc<Mutex<Vec<u8>>>) -> String {
@@ -408,9 +512,9 @@ fn is_trust_prompt(text: &str) -> bool {
 /// prompt on the very first usage check. Read-only: this never grants trust
 /// itself, only reuses a decision the user already made.
 fn trusted_claude_directory() -> Option<String> {
-    claude_trust_map()?.into_iter().find_map(|(dir, trusted)| {
-        (trusted && std::path::Path::new(&dir).is_dir()).then_some(dir)
-    })
+    claude_trust_map()?
+        .into_iter()
+        .find_map(|(dir, trusted)| (trusted && std::path::Path::new(&dir).is_dir()).then_some(dir))
 }
 
 /// Whether Claude Code has already recorded this exact directory as trusted
@@ -463,7 +567,12 @@ fn wait_for_output(
     }
 }
 
+#[cfg(test)]
 fn parse_claude_usage(text: &str) -> AgentUsage {
+    parse_claude_usage_at(text, now_unix())
+}
+
+fn parse_claude_usage_at(text: &str, collected_at: i64) -> AgentUsage {
     let mut windows = Vec::new();
     for (label, headings) in [
         ("5h", &["current session", "5-hour", "5 hour"][..]),
@@ -476,14 +585,11 @@ fn parse_claude_usage(text: &str) -> AgentUsage {
         if let Some(section) = usage_section(text, headings) {
             if let Some((percent, used)) = find_percent(section) {
                 let reset_text = reset_description(section);
-                // Codex reports a reset instant, so its remaining-time is
-                // computed on the frontend from resets_at. Claude only
-                // prints text ("Resets 3:30am (Asia/...)", "Resets Sep 21
-                // at 7pm (Asia/...)", or occasionally "Resets in 3h 12m");
-                // parse it into the same resets_at so both agents render
-                // identically, and only fall back to raw text if it doesn't
-                // match a pattern this understands.
-                let resets_at = reset_text.as_deref().and_then(parse_reset_instant);
+                // Normalize the printed reset into epoch seconds at collection
+                // time. Preserve the full description if it cannot be resolved.
+                let resets_at = reset_text
+                    .as_deref()
+                    .and_then(|text| parse_reset_instant(text, collected_at));
                 windows.push(UsageWindow {
                     label: label.to_owned(),
                     remaining_percent: if used { 100 - percent } else { percent }.clamp(0, 100),
@@ -517,6 +623,9 @@ fn parse_claude_usage(text: &str) -> AgentUsage {
         },
         windows,
         message,
+        collected_at: Some(collected_at),
+        account_id: None,
+        account_email: None,
     }
 }
 
@@ -572,25 +681,31 @@ fn now_unix() -> i64 {
 }
 
 /// Turns a Claude Code reset phrase into a Unix timestamp: either a
-/// relative "in ..." duration from now, or an absolute clock time / date +
-/// time. Claude Code runs on this machine, so an absolute time is assumed
-/// to already be in the system's local timezone — the "(Region/City)" it
-/// prints alongside is just naming that zone, not a different one to
-/// convert from.
-fn parse_reset_instant(text: &str) -> Option<i64> {
+/// relative duration from the collection instant, or a clock/date in the
+/// printed IANA timezone (system timezone only when none was printed).
+fn parse_reset_instant(text: &str, collected_at: i64) -> Option<i64> {
     if let Some(seconds) = parse_relative_duration(text) {
-        return Some(now_unix() + seconds);
+        return collected_at.checked_add(seconds);
     }
-    parse_absolute_reset(text)
+    if let Some((_, zone)) = text.rsplit_once('(') {
+        let zone: chrono_tz::Tz = zone.trim().strip_suffix(')')?.trim().parse().ok()?;
+        parse_absolute_reset(text, collected_at, zone)
+    } else {
+        parse_absolute_reset(text, collected_at, chrono::Local)
+    }
 }
 
-fn parse_absolute_reset(text: &str) -> Option<i64> {
-    use chrono::{Datelike, Local, NaiveTime, TimeZone};
+fn parse_absolute_reset<T: chrono::TimeZone>(
+    text: &str,
+    collected_at: i64,
+    zone: T,
+) -> Option<i64> {
+    use chrono::{Datelike, NaiveTime};
 
     let without_tz = text.split('(').next().unwrap_or(text).trim();
     let lower = without_tz.to_ascii_lowercase();
     let after_resets = lower.find("resets")? + "resets".len();
-    let rest = without_tz[after_resets..].trim();
+    let rest = lower[after_resets..].trim();
     if rest.is_empty() {
         return None;
     }
@@ -601,7 +716,7 @@ fn parse_absolute_reset(text: &str) -> Option<i64> {
         None => (Some(rest), None),
     };
 
-    let now = Local::now();
+    let now = zone.timestamp_opt(collected_at, 0).single()?;
     let date = match date_part {
         Some(date_text) => parse_month_day(date_text, now.year())?,
         None => now.date_naive(),
@@ -611,26 +726,34 @@ fn parse_absolute_reset(text: &str) -> Option<i64> {
         None => NaiveTime::from_hms_opt(0, 0, 0)?,
     };
 
-    let mut instant = Local.from_local_datetime(&date.and_time(time)).single()?;
-    // A bare time with no date ("Resets 3:30am") means the next occurrence
-    // of it, which is tomorrow if that time has already passed today.
-    if date_part.is_none() && instant <= now {
-        instant += chrono::Duration::days(1);
-    }
-    Some(instant.timestamp())
+    // Without a date use the collection date in that timezone. Do not roll
+    // an elapsed reset into tomorrow or a later cycle. Ambiguous/nonexistent
+    // DST times fall back to the original text rather than guessing.
+    Some(
+        zone.from_local_datetime(&date.and_time(time))
+            .single()?
+            .timestamp(),
+    )
 }
 
 fn parse_clock_time(text: &str) -> Option<chrono::NaiveTime> {
     let mut normalized = text.trim().to_ascii_uppercase().replace(' ', "");
-    if !normalized.contains(':') {
+    if !normalized.contains(':') && (normalized.ends_with("AM") || normalized.ends_with("PM")) {
         let split_at = normalized.len().checked_sub(2)?;
         normalized.insert_str(split_at, ":00");
     }
-    chrono::NaiveTime::parse_from_str(&normalized, "%I:%M%p").ok()
+    chrono::NaiveTime::parse_from_str(&normalized, "%I:%M%p")
+        .ok()
+        .or_else(|| chrono::NaiveTime::parse_from_str(&normalized, "%H:%M").ok())
 }
 
 fn parse_month_day(text: &str, year: i32) -> Option<chrono::NaiveDate> {
-    chrono::NaiveDate::parse_from_str(&format!("{} {year}", text.trim()), "%b %d %Y").ok()
+    let text = text.trim();
+    ["%b %d %Y", "%B %d %Y"].into_iter().find_map(|format| {
+        chrono::NaiveDate::parse_from_str(text, format)
+            .ok()
+            .or_else(|| chrono::NaiveDate::parse_from_str(&format!("{text} {year}"), format).ok())
+    })
 }
 
 /// Parses a relative reset phrase like "in 3h 12m", "in 45m", "in 2d 3h"
@@ -638,33 +761,30 @@ fn parse_month_day(text: &str, year: i32) -> Option<chrono::NaiveDate> {
 /// the word "in". Returns `None` for anything else (an absolute date/time).
 fn parse_relative_duration(text: &str) -> Option<i64> {
     let lower = text.to_ascii_lowercase();
-    let after_in = lower.find("in ")? + 3;
-    let bytes = lower.as_bytes();
-    let mut index = after_in;
+    let description = lower.split('(').next()?.trim();
+    let mut rest = description
+        .strip_prefix("resets ")
+        .unwrap_or(description)
+        .strip_prefix("in ")?
+        .trim();
     let mut seconds = 0_i64;
     let mut matched = false;
-    while index < bytes.len() {
-        if !bytes[index].is_ascii_digit() {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        let Ok(number) = lower[start..index].parse::<i64>() else {
-            break;
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let number = rest[..digits].parse::<i64>().ok()?;
+        rest = rest[digits..].trim_start();
+        let letters = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+        let unit_seconds = match &rest[..letters] {
+            "d" | "day" | "days" => 86_400,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "s" | "sec" | "secs" | "second" | "seconds" => 1,
+            _ => return None,
         };
-        let unit_seconds = match bytes.get(index) {
-            Some(b'd') => 86_400,
-            Some(b'h') => 3_600,
-            Some(b'm') => 60,
-            Some(b's') => 1,
-            _ => break,
-        };
-        seconds += number * unit_seconds;
+        seconds = seconds.checked_add(number.checked_mul(unit_seconds)?)?;
         matched = true;
-        index += 1;
+        rest = rest[letters..].trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+        rest = rest.strip_prefix("and ").unwrap_or(rest).trim_start();
     }
     matched.then_some(seconds)
 }
@@ -677,7 +797,6 @@ fn reset_description(section: &str) -> Option<String> {
         .next()
         .unwrap_or_default()
         .split_whitespace()
-        .take(8)
         .collect::<Vec<_>>()
         .join(" ");
     (!value.is_empty()).then_some(value)
@@ -730,19 +849,35 @@ pub struct UsageSnapshot {
     host_label: String,
     /// The provider account the limits belong to; hosts signed in to the same
     /// account share one set of limits, so this is what groups them.
+    #[serde(skip_serializing_if = "Option::is_none")]
     account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_email: Option<String>,
     collected_at: i64,
     windows: Vec<UsageWindow>,
 }
 
 /// Who an agent is signed in to on this device: a stable id plus something
 /// readable (the email) when the provider's files hold one.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccount {
     agent_id: String,
     account_id: String,
     label: Option<String>,
+}
+
+#[cfg(test)]
+fn local_account_id(agent_id: &str) -> Option<String> {
+    local_account(agent_id).map(|account| account.account_id)
+}
+
+fn local_account(agent_id: &str) -> Option<AgentAccount> {
+    match agent_id {
+        "codex" => codex_account(),
+        "claude" => claude_account(),
+        _ => None,
+    }
 }
 
 fn codex_account() -> Option<AgentAccount> {
@@ -751,47 +886,119 @@ fn codex_account() -> Option<AgentAccount> {
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?
         .join("auth.json");
     let json: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    codex_account_from_json(&json)
+}
+
+fn identity_text(value: Option<&Value>, limit: usize) -> Option<String> {
+    value?
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && text.chars().count() <= limit)
+        .map(str::to_owned)
+}
+
+fn codex_account_from_json(json: &Value) -> Option<AgentAccount> {
     let tokens = json.get("tokens")?;
-    let account_id = tokens.get("account_id")?.as_str()?.to_owned();
+    let account_id = identity_text(tokens.get("account_id"), 200)?;
     let label = tokens
         .get("id_token")
         .and_then(Value::as_str)
         .and_then(|jwt| jwt.split('.').nth(1))
         .and_then(|part| {
             use base64::Engine;
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part.trim_end_matches('=')).ok()
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(part.trim_end_matches('='))
+                .ok()
         })
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|claims| claims.get("email").and_then(Value::as_str).map(str::to_owned));
-    Some(AgentAccount { agent_id: "codex".to_owned(), account_id, label })
+        .and_then(|claims| identity_text(claims.get("email"), 320));
+    Some(AgentAccount {
+        agent_id: "codex".to_owned(),
+        account_id,
+        label,
+    })
 }
 
 fn claude_account() -> Option<AgentAccount> {
     let path = dirs::home_dir()?.join(".claude.json");
     let json: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    claude_account_from_json(&json)
+}
+
+fn claude_account_from_json(json: &Value) -> Option<AgentAccount> {
     let account = json.get("oauthAccount")?;
     Some(AgentAccount {
         agent_id: "claude".to_owned(),
-        account_id: account.get("accountUuid")?.as_str()?.to_owned(),
-        label: account.get("emailAddress").and_then(Value::as_str).map(str::to_owned),
+        account_id: identity_text(account.get("accountUuid"), 200)?,
+        label: identity_text(account.get("emailAddress"), 320),
     })
 }
 
 #[tauri::command]
 pub fn get_local_accounts() -> Vec<AgentAccount> {
-    [codex_account(), claude_account()].into_iter().flatten().collect()
+    [codex_account(), claude_account()]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Prints the newest Codex limits line on a host. A unix socket is not needed:
 /// the desktop app runs this over its ordinary ssh exec, so the host stores
 /// nothing and holds no credential.
-const REMOTE_CODEX_SCRIPT: &str = r#"h="${CODEX_HOME:-$HOME/.codex}"; d="$h/sessions"; [ -d "$d" ] || exit 0; a=$(grep -o '"account_id" *: *"[^"]*"' "$h/auth.json" 2>/dev/null | head -1 | sed 's/.*: *"\(.*\)"/\1/'); [ -n "$a" ] && printf 'ACCOUNT %s\n' "$a"; find "$d" -name 'rollout-*.jsonl' -type f 2>/dev/null | sort -r | head -8 | while IFS= read -r f; do l=$(tail -c 262144 "$f" | grep '"rate_limits"' | tail -1); if [ -n "$l" ]; then printf '%s\n' "$l"; break; fi; done"#;
+const REMOTE_ACCOUNT_PYTHON: &str = include_str!("remote/usage_account.py");
+const REMOTE_CODEX_LOG_SCRIPT: &str = r#"h="${CODEX_HOME:-$HOME/.codex}"; d="$h/sessions"; [ -d "$d" ] || exit 0; find "$d" -name 'rollout-*.jsonl' -type f 2>/dev/null | sort -r | head -8 | while IFS= read -r f; do l=$(tail -c 262144 "$f" | grep '"rate_limits"' | tail -1); if [ -n "$l" ]; then printf '%s\n' "$l"; break; fi; done"#;
+
+fn remote_account_probe() -> String {
+    format!(
+        "if command -v python3 >/dev/null 2>&1; then python3 -c {} codex 2>/dev/null; else {}; fi",
+        crate::session::shell_quote(REMOTE_ACCOUNT_PYTHON),
+        r#"grep -o '"account_id" *: *"[^"]*"' "${CODEX_HOME:-$HOME/.codex}/auth.json" 2>/dev/null | head -1 | sed 's/.*: *"\(.*\)"/ACCOUNT \1/'"#,
+    )
+}
+
+fn remote_account(output: &str) -> Option<AgentAccount> {
+    if let Some(encoded) = output
+        .lines()
+        .find_map(|line| line.strip_prefix("ACCOUNT_JSON "))
+    {
+        let value: Value = serde_json::from_str(encoded).ok()?;
+        let account_id = value.get("accountId")?.as_str()?.trim();
+        if account_id.is_empty() || account_id.len() > 200 {
+            return None;
+        }
+        let label = value
+            .get("accountEmail")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|email| !email.is_empty() && email.len() <= 320)
+            .map(str::to_owned);
+        return Some(AgentAccount {
+            agent_id: "codex".to_owned(),
+            account_id: account_id.to_owned(),
+            label,
+        });
+    }
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("ACCOUNT "))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| AgentAccount {
+            agent_id: "codex".to_owned(),
+            account_id: id.to_owned(),
+            label: None,
+        })
+}
 
 /// Stable, URL-safe id for a host the account keys snapshots by.
 pub(crate) fn remote_host_id(endpoint: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(endpoint.as_bytes());
-    let hex: String = digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect();
+    let hex: String = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     format!("ssh-{hex}")
 }
 
@@ -817,20 +1024,23 @@ pub async fn get_remote_usage(
             .map(|endpoint| {
                 let app = app.clone();
                 thread::spawn(move || {
+                    let probe = remote_account_probe();
+                    let script = format!("{probe}; {REMOTE_CODEX_LOG_SCRIPT}");
                     let output =
-                        crate::remote_fs::run_remote_script(&endpoint, REMOTE_CODEX_SCRIPT, &app)
-                            .ok()?;
-                    let account_id = output
-                        .lines()
-                        .find_map(|line| line.strip_prefix("ACCOUNT "))
-                        .map(|id| id.trim().to_owned())
-                        .filter(|id| !id.is_empty());
-                    let (windows, collected_at) = codex_usage_from_log(&output, now_unix())?;
+                        crate::remote_fs::run_remote_script(&endpoint, &script, &app).ok()?;
+                    let account = remote_account(&output);
+                    let after =
+                        crate::remote_fs::run_remote_script(&endpoint, &probe, &app).ok()?;
+                    if account != remote_account(&after) {
+                        return None;
+                    }
+                    let (windows, collected_at) = codex_usage_from_log(&output)?;
                     Some(UsageSnapshot {
                         agent_id: "codex".to_owned(),
                         host_id: remote_host_id(&endpoint),
                         host_label: remote_host_label(&app, &endpoint),
-                        account_id,
+                        account_id: account.as_ref().map(|a| a.account_id.clone()),
+                        account_email: account.and_then(|a| a.label),
                         collected_at,
                         windows,
                     })
@@ -849,20 +1059,84 @@ pub async fn get_remote_usage(
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_usage_from_log, fetch_claude_usage, newest_rollouts, now_unix, parse_claude_usage,
+        codex_usage_from_log, fetch_claude_usage, newest_rollouts, parse_claude_usage,
         parse_relative_duration, parse_reset_instant, remote_host_id, terminal_text,
     };
 
+    #[test]
+    fn provider_account_metadata_does_not_serialize_credentials() {
+        use base64::Engine;
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"email":"codex@example.com"}"#);
+        let auth = serde_json::json!({"tokens": {
+            "account_id": "codex-id", "id_token": format!("header.{claims}.signature"),
+            "refresh_token": "secret-refresh", "access_token": "secret-access"
+        }});
+        let account = super::codex_account_from_json(&auth).unwrap();
+        assert_eq!(account.account_id, "codex-id");
+        assert_eq!(account.label.as_deref(), Some("codex@example.com"));
+        let claude = super::claude_account_from_json(&serde_json::json!({
+            "emailAddress": "wrong@example.com",
+            "oauthAccount": {"accountUuid": "claude-id", "emailAddress": "claude@example.com"}
+        }))
+        .unwrap();
+        assert_eq!(claude.label.as_deref(), Some("claude@example.com"));
+        let wire = serde_json::to_string(&account).unwrap();
+        assert!(!wire.contains("secret-"));
+        assert!(!wire.contains("id_token"));
+        let without_email = super::codex_account_from_json(&serde_json::json!({
+            "tokens": {"account_id": "codex-id", "id_token": "broken"}
+        }))
+        .unwrap();
+        assert!(without_email.label.is_none());
+    }
+
+    #[test]
+    fn remote_account_and_snapshot_keep_id_and_email_together() {
+        let account = super::remote_account(
+            "shell banner\nACCOUNT_JSON {\"accountId\":\"account-a\",\"accountEmail\":\"a@example.com\"}\n"
+        ).unwrap();
+        let snapshot = super::UsageSnapshot {
+            agent_id: "codex".to_owned(),
+            host_id: "ssh-test".to_owned(),
+            host_label: "Test".to_owned(),
+            account_id: Some(account.account_id),
+            account_email: account.label,
+            collected_at: 123,
+            windows: Vec::new(),
+        };
+        let payload = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(payload["accountId"], "account-a");
+        assert_eq!(payload["accountEmail"], "a@example.com");
+        assert_eq!(payload["collectedAt"], 123);
+        assert!(super::remote_account("ACCOUNT_JSON {}\n").is_none());
+        let legacy = super::remote_account("ACCOUNT legacy-id\n").unwrap();
+        assert_eq!(legacy.account_id, "legacy-id");
+        assert!(legacy.label.is_none());
+        let no_email = super::UsageSnapshot {
+            account_email: None,
+            ..snapshot
+        };
+        assert!(serde_json::to_value(no_email)
+            .unwrap()
+            .get("accountEmail")
+            .is_none());
+    }
+
     const LOG: &str = concat!(
-        r#"{"timestamp":"2026-10-04T13:00:00.000Z","type":"event_msg","payload":{"type":"agent_message"}}"#, "\n",
-        r#"{"timestamp":"2026-10-04T13:10:00.000Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0,"window_minutes":300,"resets_at":2000},"secondary":{"used_percent":2.0,"window_minutes":10080,"resets_at":9000}}}}"#, "\n",
-        r#"{"timestamp":"2026-10-04T13:14:30.903Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":28.0,"window_minutes":300,"resets_at":2000},"secondary":{"used_percent":4.4,"window_minutes":10080,"resets_at":9000}}}}"#, "\n",
-        r#"{"timestamp":"2026-10-04T13:15:00.000Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#, "\n",
+        r#"{"timestamp":"2026-10-04T13:00:00.000Z","type":"event_msg","payload":{"type":"agent_message"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-04T13:10:00.000Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0,"window_minutes":300,"resets_at":2000},"secondary":{"used_percent":2.0,"window_minutes":10080,"resets_at":9000}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-04T13:14:30.903Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":28.0,"window_minutes":300,"resets_at":2000},"secondary":{"used_percent":4.4,"window_minutes":10080,"resets_at":9000}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-04T13:15:00.000Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+        "\n",
     );
 
     #[test]
     fn codex_limits_come_from_the_last_token_count_with_rate_limits() {
-        let (windows, written) = codex_usage_from_log(LOG, 1000).unwrap();
+        let (windows, written) = codex_usage_from_log(LOG).unwrap();
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "5h");
         assert_eq!(windows[0].remaining_percent, 72);
@@ -873,12 +1147,12 @@ mod tests {
     }
 
     #[test]
-    fn a_window_that_already_reset_is_not_reported() {
-        let (windows, _) = codex_usage_from_log(LOG, 3000).unwrap();
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].label, "Week");
-        assert!(codex_usage_from_log(LOG, 9500).is_none());
-        assert!(codex_usage_from_log("not json\n", 0).is_none());
+    fn expired_windows_keep_their_original_instants() {
+        let (windows, _) = codex_usage_from_log(LOG).unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].resets_at, Some(2000));
+        assert_eq!(windows[1].resets_at, Some(9000));
+        assert!(codex_usage_from_log("not json\n").is_none());
     }
 
     #[test]
@@ -892,7 +1166,23 @@ mod tests {
         ] {
             let dir = root.join(day);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(name), "").unwrap();
+            let path = dir.join(name);
+            std::fs::write(&path, "").unwrap();
+            let seconds = if name.contains("21-00") {
+                3
+            } else if name.contains("08-00") {
+                2
+            } else {
+                1
+            };
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                    ),
+                )
+                .unwrap();
         }
         let names: Vec<String> = newest_rollouts(&root, 2)
             .iter()
@@ -900,10 +1190,113 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["rollout-2026-10-04T21-00-00-c.jsonl", "rollout-2026-10-04T08-00-00-b.jsonl"]
+            [
+                "rollout-2026-10-04T21-00-00-c.jsonl",
+                "rollout-2026-10-04T08-00-00-b.jsonl"
+            ]
         );
         assert_eq!(newest_rollouts(&root, 10).len(), 3);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct LogFixture(std::path::PathBuf);
+
+    impl LogFixture {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("fastade-usage-{}", uuid::Uuid::new_v4())))
+        }
+
+        fn write(&self, day: &str, written: i64, used: i64, modified: u64) {
+            let dir = self.0.join(format!("2026/10/{day}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("rollout-{day}.jsonl"));
+            let event = serde_json::json!({
+                "timestamp": chrono::DateTime::from_timestamp(written, 0).unwrap().to_rfc3339(),
+                "payload": {"type": "token_count", "rate_limits": {
+                    "primary": {"used_percent": used, "resets_at": 2000},
+                    "secondary": {"used_percent": used, "resets_at": 9000}
+                }}
+            });
+            std::fs::write(&path, event.to_string()).unwrap();
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified),
+                    ),
+                )
+                .unwrap();
+        }
+    }
+
+    impl Drop for LogFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn active_older_sessions_are_found_and_latest_limit_event_wins() {
+        let logs = LogFixture::new();
+        for day in 2..=10 {
+            logs.write(&format!("{day:02}"), 800, 10, day);
+        }
+        logs.write("01", 950, 40, 20);
+        // A later unrelated write in another log must not win over a newer limit event.
+        logs.write("11", 900, 20, 30);
+        assert_eq!(
+            newest_rollouts(&logs.0, 2)[1].file_name().unwrap(),
+            "rollout-01.jsonl"
+        );
+        let (windows, written) = super::codex_log_usage(&logs.0).unwrap();
+        assert_eq!(written, 950);
+        assert_eq!(windows[0].remaining_percent, 60);
+    }
+
+    #[test]
+    fn manual_refresh_bypasses_even_fresh_codex_logs() {
+        let logs = LogFixture::new();
+        logs.write("01", 950, 40, 1);
+        let cached = super::codex_usage_with_refresh(&logs.0, false, 1000, || {
+            panic!("fresh cache should be reused")
+        })
+        .unwrap();
+        assert_eq!(cached.windows[0].remaining_percent, 60);
+        assert_eq!(cached.collected_at, Some(950));
+        let live =
+            super::codex_usage_with_refresh(&logs.0, true, 1000, || Err("live lookup".to_owned()));
+        assert_eq!(live.err().as_deref(), Some("live lookup"));
+    }
+
+    #[test]
+    fn stale_or_partly_reset_codex_logs_require_live_limits() {
+        let logs = LogFixture::new();
+        logs.write("01", 950, 40, 1);
+        for now in [1250, 3000] {
+            let live = super::codex_usage_with_refresh(&logs.0, false, now, || {
+                Err("live lookup".to_owned())
+            });
+            assert_eq!(live.err().as_deref(), Some("live lookup"));
+        }
+        logs.write("01", 2950, 40, 1);
+        let live =
+            super::codex_usage_with_refresh(&logs.0, false, 3000, || Err("live lookup".to_owned()));
+        assert_eq!(live.err().as_deref(), Some("live lookup"));
+    }
+
+    #[test]
+    #[ignore = "requires a locally installed and logged-in Codex CLI"]
+    fn fetches_live_codex_usage() {
+        let usage = super::fetch_codex_usage(true).expect("live Codex lookup should succeed");
+        println!("status={} windows={}", usage.status, usage.windows.len());
+        assert_eq!(usage.status, "available");
+        println!("CODEX_WIRE {}", serde_json::to_string(&usage).unwrap());
+        for window in usage.windows {
+            println!(
+                "{} {}% resets_at={:?}",
+                window.label, window.remaining_percent, window.resets_at
+            );
+        }
     }
 
     #[test]
@@ -913,7 +1306,10 @@ mod tests {
             .expect("a recent Codex log with unexpired limits");
         println!("written={written} windows={}", windows.len());
         for window in &windows {
-            println!("{} {}% resets_at={:?}", window.label, window.remaining_percent, window.resets_at);
+            println!(
+                "{} {}% resets_at={:?}",
+                window.label, window.remaining_percent, window.resets_at
+            );
         }
         assert!(!windows.is_empty());
     }
@@ -921,13 +1317,18 @@ mod tests {
     #[test]
     #[ignore = "requires local Codex session logs; verifies the remote script on this machine's sh"]
     fn remote_script_prints_a_parsable_line() {
+        let script = format!(
+            "{}; {}",
+            super::remote_account_probe(),
+            super::REMOTE_CODEX_LOG_SCRIPT
+        );
         let output = std::process::Command::new("sh")
-            .args(["-c", super::REMOTE_CODEX_SCRIPT])
+            .args(["-c", &script])
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(text.lines().count(), 1, "stderr: {}", String::from_utf8_lossy(&output.stderr));
-        assert!(codex_usage_from_log(&text, now_unix()).is_some());
+        assert!(super::remote_account(&text).is_some());
+        assert!(codex_usage_from_log(&text).is_some());
     }
 
     #[test]
@@ -935,7 +1336,9 @@ mod tests {
         let id = remote_host_id("managed:abc");
         assert_eq!(id, remote_host_id("managed:abc"));
         assert_ne!(id, remote_host_id("managed:abd"));
-        assert!(id.starts_with("ssh-") && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert!(
+            id.starts_with("ssh-") && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        );
     }
 
     #[test]
@@ -953,22 +1356,103 @@ mod tests {
     }
 
     #[test]
-    fn absolute_clock_time_resolves_to_the_next_occurrence() {
-        let now = now_unix();
-        let resets_at = parse_reset_instant("Resets 3:30am (Asia/Kuala_Lumpur)").unwrap();
-        assert!(resets_at > now);
-        assert!(
-            resets_at <= now + 86_400,
-            "should be within a day, got {}s away",
-            resets_at - now
+    fn absolute_resets_use_the_printed_zone_and_never_roll_expired_times_forward() {
+        let collected_at = epoch("2026-10-22T15:00:00Z");
+        for (text, expected) in [
+            ("Resets 7pm (Asia/Seoul)", "2026-10-23T10:00:00Z"),
+            ("Resets 3:30am (Asia/Kuala_Lumpur)", "2026-10-21T19:30:00Z"),
+            (
+                "Resets Oct 26 at 7:59pm (Asia/Seoul)",
+                "2026-10-26T10:59:00Z",
+            ),
+            ("Resets Oct 21 at 7pm (Asia/Seoul)", "2026-10-21T10:00:00Z"),
+            ("Resets Dec 31 2025 at 19:00 (UTC)", "2025-12-31T19:00:00Z"),
+        ] {
+            assert_eq!(
+                parse_reset_instant(text, collected_at),
+                Some(epoch(expected)),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_reset_instant("Resets 7pm (Unknown/Zone)", collected_at),
+            None
+        );
+        assert_eq!(
+            parse_reset_instant("Resets Nov 1 at 1:30am (America/New_York)", collected_at),
+            None
+        );
+        assert_eq!(
+            parse_reset_instant("Resets Mar 8 at 2:30am (America/New_York)", collected_at),
+            None
         );
     }
 
+    fn epoch(text: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .timestamp()
+    }
+
     #[test]
-    fn absolute_date_and_time_resolves_to_a_future_instant() {
-        let now = now_unix();
-        let resets_at = parse_reset_instant("Resets Sep 21 at 7pm (Asia/Kuala_Lumpur)").unwrap();
-        assert!(resets_at > now - 400 * 86_400);
+    fn relative_resets_are_anchored_to_collection_not_upload() {
+        assert_eq!(parse_reset_instant("Resets in 2h 13m", 1000), Some(8980));
+        assert_eq!(
+            parse_reset_instant("in 2 hours and 13 minutes", 1000),
+            Some(8980)
+        );
+        assert_eq!(
+            parse_relative_duration("Resets in 2h something unknown"),
+            None
+        );
+        assert_eq!(
+            parse_relative_duration("Resets in 9223372036854775807d"),
+            None
+        );
+        assert_eq!(parse_relative_duration("Resets in 2 months"), None);
+    }
+
+    #[test]
+    fn both_agents_serialize_the_same_seconds_and_fallback_contract() {
+        let collected_at = epoch("2026-10-22T15:00:00Z");
+        let claude = super::parse_claude_usage_at(
+            "Current session 23% used Resets in 2h 13m\nCurrent week (all models) 41% used Resets Oct 26 at 7:59pm (Asia/Seoul)\nCurrent week (Sonnet only) 80% remaining Resets after a provider event with more than eight original words",
+            collected_at,
+        );
+        assert_eq!(claude.collected_at, Some(collected_at));
+        let json = serde_json::to_value(&claude).unwrap();
+        assert_eq!(json["windows"][0]["resetsAt"], collected_at + 7980);
+        assert_eq!(
+            json["windows"][1]["resetsAt"],
+            epoch("2026-10-26T10:59:00Z")
+        );
+        assert!(json["windows"][0].get("resetText").is_none());
+        assert!(json["windows"][2].get("resetsAt").is_none());
+        assert_eq!(
+            json["windows"][2]["resetText"],
+            "Resets after a provider event with more than eight original words"
+        );
+        let mut codex = Vec::new();
+        for value in [
+            serde_json::json!({"usedPercent": 23.0, "resetsAt": (collected_at + 7980) * 1000}),
+            serde_json::json!({"usedPercent": 41, "resetText": "Resets Oct 26 at 7:59pm (Asia/Seoul)"}),
+            serde_json::json!({"usedPercent": 20, "resetsAt": null, "resetText": "Resets after a provider event"}),
+            serde_json::json!({"usedPercent": 0, "resetsAt": null, "resetText": null}),
+        ] {
+            super::append_window(&mut codex, "test", &value, collected_at);
+        }
+        let json = serde_json::to_value(&codex).unwrap();
+        assert_eq!(json[0]["resetsAt"], collected_at + 7980);
+        assert_eq!(json[1]["resetsAt"], epoch("2026-10-26T10:59:00Z"));
+        assert!(json[2].get("resetsAt").is_none());
+        assert!(json[3].get("resetsAt").is_none());
+        assert!(json[3].get("resetText").is_none());
+    }
+
+    #[test]
+    fn logs_without_a_source_timestamp_are_not_restamped_as_fresh() {
+        let value = serde_json::json!({"payload": {"type": "token_count", "rate_limits": {"primary": {"used_percent": 5, "resets_at": 3000}}}});
+        assert!(codex_usage_from_log(&value.to_string()).is_none());
     }
 
     #[test]
@@ -994,11 +1478,79 @@ mod tests {
         println!("status={} message={:?}", usage.status, usage.message);
         assert_eq!(usage.status, "available", "message: {:?}", usage.message);
         assert!(!usage.windows.is_empty());
+        println!("CLAUDE_WIRE {}", serde_json::to_string(&usage).unwrap());
         for window in &usage.windows {
             println!(
                 "{} -> {}% remaining",
                 window.label, window.remaining_percent
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "collects real CLI limits and uploads them using the desktop's existing signed-in backend session"]
+    fn uploads_live_usage_and_verifies_server_round_trip() {
+        // Keep the same device/host row as the app, so acceptance checks do
+        // not leave synthetic hosts in the user's usage list.
+        let auth = serde_json::to_value(crate::auth::google_auth_status()).unwrap();
+        let device = auth["deviceId"]
+            .as_str()
+            .expect("desktop must be signed in");
+        let host_id = format!("device-{device}");
+        let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .map(|path| path.to_string_lossy().into_owned());
+        let mut verified = Vec::new();
+        for agent in ["codex", "claude"] {
+            let account_id = super::local_account_id(agent).expect("CLI must be signed in");
+            let usage = match agent {
+                "codex" => super::fetch_codex_usage(true),
+                _ => super::fetch_claude_usage(cwd.clone()),
+            }
+            .expect("live collection must succeed");
+            assert_eq!(usage.status, "available", "{:?}", usage.message);
+            assert_eq!(Some(&account_id), super::local_account_id(agent).as_ref());
+            for label in ["5h", "Week"] {
+                assert!(
+                    usage
+                        .windows
+                        .iter()
+                        .any(|window| window.label == label && window.resets_at.is_some()),
+                    "{agent} {label} missing reset"
+                );
+            }
+            let snapshot = super::UsageSnapshot {
+                agent_id: agent.to_owned(),
+                host_id: host_id.clone(),
+                host_label: "This device".to_owned(),
+                account_id: Some(account_id),
+                account_email: super::local_account(agent).and_then(|a| a.label),
+                collected_at: usage.collected_at.unwrap(),
+                windows: usage.windows,
+            };
+            let payload = serde_json::to_value(&snapshot).unwrap();
+            tauri::async_runtime::block_on(crate::auth::put_usage_snapshot(payload.clone()))
+                .expect("upload must succeed");
+            let response = tauri::async_runtime::block_on(crate::auth::list_usage_snapshots())
+                .expect("GET must succeed");
+            let saved = response["snapshots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["agentId"] == agent && row["accountId"] == payload["accountId"])
+                .expect("uploaded account must be returned");
+            assert_eq!(saved["accountEmail"], payload["accountEmail"]);
+            assert_eq!(saved["windows"], payload["windows"]);
+            assert_eq!(
+                saved["collectedAt"].as_f64(),
+                payload["collectedAt"].as_i64().map(|at| at as f64)
+            );
+            println!("VERIFIED_SNAPSHOT {payload}");
+            verified.push(payload);
+        }
+        if let Ok(path) = std::env::var("FASTADE_USAGE_VERIFICATION_JSON") {
+            std::fs::write(path, serde_json::to_vec_pretty(&verified).unwrap()).unwrap();
         }
     }
 

@@ -1,0 +1,63 @@
+const en = {
+  title: 'Voice input', login: 'Sign in to use voice input', close: 'Cancel',
+  language: 'Speech language', auto: 'Detect automatically', korean: 'Korean', english: 'English',
+  start: 'Start recording', stop: 'Stop and transcribe', again: 'Record again', retry: 'Retry transcription',
+  idle: 'Record up to 60 seconds. Audio is sent to the transcription service after you stop.',
+  permission: 'Waiting for microphone permission…', recording: 'Recording', transcribing: 'Transcribing…',
+  review: 'Review and edit your text', send: 'Send to session', sending: 'Sending…',
+  hint: 'Send submits the text to this session. Line breaks are converted to spaces.',
+  unavailableSession: 'This session has disconnected. Reconnect it before sending.',
+  errors: {
+    permission_denied: 'Microphone access was denied. Allow fastade in your system microphone settings, then try again.',
+    microphone: 'Could not record from the microphone. Check your input device and try again.',
+    unsupported: 'This audio format or microphone recording is not supported here.',
+    empty_audio: 'No audio was recorded. Record again.',
+    empty_text: 'No speech was recognized. Record again or try another language.',
+    too_large: 'The recording exceeds the 10 MB limit. Make a shorter recording.',
+    invalid_audio: 'The service could not read this recording. Try a shorter recording.',
+    auth: 'Your login has expired. Sign in again to use voice input.',
+    unavailable: 'The voice transcription API is not available on the server yet. You can retry this recording later.',
+    rate_limit: 'The voice input limit was reached. Wait before retrying.',
+    network: 'Could not reach the service. Check your connection and retry.',
+    timeout: 'Transcription timed out. You can retry the recording.',
+    service: 'The transcription service is temporarily unavailable. Try again later.',
+    session: 'This session is no longer connected. Reconnect it before sending.',
+    send: 'Could not send the text. Check the session before retrying; it may have received part of the input.',
+    busy: 'Another transcription is running. Try again shortly.',
+    fallback: 'Voice input failed. Try again.',
+  },
+};
+
+const ko: typeof en = {
+  title: '음성 입력', login: '음성 입력을 사용하려면 로그인하세요', close: '취소',
+  language: '음성 언어', auto: '자동 감지', korean: '한국어', english: '영어',
+  start: '녹음 시작', stop: '녹음 종료 후 텍스트 변환', again: '다시 녹음', retry: '텍스트 변환 재시도',
+  idle: '최대 60초 동안 녹음합니다. 녹음을 마치면 음성을 변환 서비스로 전송합니다.',
+  permission: '마이크 사용 권한을 기다리는 중…', recording: '녹음 중', transcribing: '텍스트로 변환 중…',
+  review: '텍스트 확인 및 수정', send: '세션에 전송', sending: '전송 중…',
+  hint: '전송하면 이 세션에 텍스트를 입력하고 제출합니다. 줄바꿈은 공백으로 바뀝니다.',
+  unavailableSession: '세션 연결이 끊어졌습니다. 다시 연결한 뒤 전송하세요.',
+  errors: {
+    permission_denied: '마이크 접근이 거부되었습니다. 시스템 마이크 설정에서 fastade를 허용한 뒤 다시 시도하세요.',
+    microphone: '마이크로 녹음할 수 없습니다. 입력 장치를 확인하고 다시 시도하세요.',
+    unsupported: '이 환경에서는 해당 오디오 형식 또는 마이크 녹음을 지원하지 않습니다.',
+    empty_audio: '녹음된 음성이 없습니다. 다시 녹음하세요.',
+    empty_text: '음성을 인식하지 못했습니다. 다시 녹음하거나 다른 언어를 선택하세요.',
+    too_large: '녹음이 10MB 제한을 초과했습니다. 더 짧게 녹음하세요.',
+    invalid_audio: '서버가 녹음을 읽을 수 없습니다. 더 짧게 녹음해 보세요.',
+    auth: '로그인이 만료되었습니다. 다시 로그인한 뒤 음성 입력을 사용하세요.',
+    unavailable: '서버에 음성 변환 API가 아직 제공되지 않습니다. 나중에 이 녹음으로 재시도할 수 있습니다.',
+    rate_limit: '음성 입력 사용 한도에 도달했습니다. 잠시 후 다시 시도하세요.',
+    network: '서버에 연결할 수 없습니다. 네트워크를 확인하고 다시 시도하세요.',
+    timeout: '텍스트 변환 시간이 초과되었습니다. 녹음을 다시 전송할 수 있습니다.',
+    service: '음성 변환 서비스를 일시적으로 사용할 수 없습니다. 나중에 다시 시도하세요.',
+    session: '세션 연결이 끊어졌습니다. 다시 연결한 뒤 전송하세요.',
+    send: '텍스트를 전송하지 못했습니다. 일부 입력이 전달되었을 수 있으니 세션을 확인한 뒤 다시 시도하세요.',
+    busy: '다른 음성을 변환하고 있습니다. 잠시 후 다시 시도하세요.',
+    fallback: '음성 입력에 실패했습니다. 다시 시도하세요.',
+  },
+};
+
+export function voiceMessages(locale = navigator.language): typeof en {
+  return locale.toLowerCase().startsWith('ko') ? ko : en;
+}

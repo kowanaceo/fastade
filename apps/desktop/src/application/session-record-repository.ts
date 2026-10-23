@@ -1,9 +1,10 @@
 import type { SessionRecord, SessionRecordDraft } from '../domain/session-record';
+import type { TaskExecutionStore } from './task-execution';
 
 /** Transport-independent CRUD boundary. The local adapter stores records on
  * this device; a future backend adapter must authenticate every call, enforce
  * profile ownership, and report conflicts as failures. */
-export interface SessionRecordRepository {
+export interface SessionRecordRepository extends TaskExecutionStore {
   list(profileId: string): Promise<SessionRecord[]>;
   create(profileId: string, draft: SessionRecordDraft): Promise<SessionRecord>;
   update(record: SessionRecord, draft: SessionRecordDraft): Promise<SessionRecord>;

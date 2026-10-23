@@ -1,6 +1,6 @@
 [package]
 name = "fastade-desktop"
-version = "0.4.3"
+version = "0.5.2"
 description = "Multi AI CLI desktop client"
 edition = "2021"
 rust-version = "1.88"
@@ -28,9 +28,10 @@ chrono = "0.4"
 sysinfo = "0.32"
 toml_edit = "0.22"
 base64 = "0.22"
-reqwest = { version = "0.13", features = ["form", "json"] }
+reqwest = { version = "0.13", features = ["form", "json", "multipart"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["sync"] }
+chrono-tz = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
