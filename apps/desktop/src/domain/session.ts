@@ -98,7 +98,9 @@ export interface WebAgent {
 export interface UsageWindow {
   label: string;
   remainingPercent: number;
+  /** Absolute Unix epoch seconds (integer), including elapsed reset instants. */
   resetsAt?: number;
+  /** Original provider description only when an absolute instant is unknown. */
   resetText?: string;
 }
 
@@ -107,6 +109,12 @@ export interface AgentUsage {
   status: 'available' | 'unavailable' | 'error';
   windows: UsageWindow[];
   message?: string;
+  /** Provider collection time in epoch seconds; unchanged on cache hits. */
+  collectedAt?: number;
+  /** Stable provider account id captured with this result. */
+  accountId?: string;
+  /** Email from the same provider login captured with these limits. */
+  accountEmail?: string;
 }
 
 /** One host's limits at `collectedAt` (epoch seconds), as the account stores
@@ -123,6 +131,8 @@ export interface UsageSnapshot {
   hostLabel: string;
   /** Provider account the limits belong to; hosts on one account share them. */
   accountId?: string;
+  /** Email from the same provider login captured with these limits. */
+  accountEmail?: string;
   collectedAt: number;
   windows: UsageWindow[];
 }

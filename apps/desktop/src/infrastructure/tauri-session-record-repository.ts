@@ -4,6 +4,14 @@ import type { SessionRecord, SessionRecordDraft } from '../domain/session-record
 
 /** Stores notes and tasks in this device's app data directory only. */
 export class TauriSessionRecordRepository implements SessionRecordRepository {
+  claimTodoTasks(profileId: string, taskIds?: string[]): Promise<SessionRecord[]> {
+    return invoke<SessionRecord[]>('claim_todo_tasks', { profileId, taskIds });
+  }
+
+  restoreClaimedTasks(tasks: SessionRecord[]): Promise<void> {
+    return invoke<void>('restore_claimed_tasks', { tasks });
+  }
+
   list(profileId: string): Promise<SessionRecord[]> {
     return invoke<SessionRecord[]>('list_session_records', { profileId });
   }

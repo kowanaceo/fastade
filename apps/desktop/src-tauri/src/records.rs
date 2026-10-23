@@ -5,7 +5,7 @@ use std::{
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
 /// Notes and tasks attached to a saved session profile. They are stored only
@@ -136,6 +136,98 @@ pub fn update_session_record(
     app: tauri::AppHandle,
 ) -> Result<SessionRecord, String> {
     update_record_with(&app, &id, |_| Ok(draft))
+}
+
+/// Claim the latest todo records under the same lock as MCP and direct edits.
+/// An omitted ID list means all current todos, including newly synced records.
+#[tauri::command]
+pub fn claim_todo_tasks(
+    profile_id: String,
+    task_ids: Option<Vec<String>>,
+    app: tauri::AppHandle,
+) -> Result<Vec<SessionRecord>, String> {
+    let claimed = {
+        let _guard = STORE_LOCK.lock().map_err(|error| error.to_string())?;
+        let path = records_path(&app)?;
+        let mut records = read_records(&path)?;
+        let claimed = claim_tasks(&mut records, &profile_id, task_ids.as_deref(), now_millis());
+        if !claimed.is_empty() {
+            write_records(&path, &records)?;
+        }
+        claimed
+    };
+    if !claimed.is_empty() {
+        let _ = app.emit("records-changed", ());
+    }
+    Ok(claimed)
+}
+
+fn claim_tasks(
+    records: &mut [SessionRecord],
+    profile_id: &str,
+    task_ids: Option<&[String]>,
+    now: u64,
+) -> Vec<SessionRecord> {
+    let mut claimed = Vec::new();
+    for record in records {
+        if record.profile_id != profile_id
+            || record.kind != "task"
+            || record.status.as_deref() != Some("todo")
+            || task_ids.is_some_and(|ids| !ids.contains(&record.id))
+        {
+            continue;
+        }
+        record.status = Some("in progress".into());
+        record.updated_at = now.max(record.updated_at + 1);
+        claimed.push(record.clone());
+    }
+    claimed.sort_by_key(|record| record.created_at);
+    claimed
+}
+
+/// A failed handoff only restores records unchanged since this exact claim.
+#[tauri::command]
+pub fn restore_claimed_tasks(
+    tasks: Vec<SessionRecord>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let changed = {
+        let _guard = STORE_LOCK.lock().map_err(|error| error.to_string())?;
+        let path = records_path(&app)?;
+        let mut records = read_records(&path)?;
+        let changed = restore_tasks(&mut records, &tasks, now_millis());
+        if changed {
+            write_records(&path, &records)?;
+        }
+        changed
+    };
+    if changed {
+        let _ = app.emit("records-changed", ());
+    }
+    Ok(())
+}
+
+fn restore_tasks(records: &mut [SessionRecord], claimed: &[SessionRecord], now: u64) -> bool {
+    let mut changed = false;
+    for record in records {
+        if record.kind != "task" || record.status.as_deref() != Some("in progress") {
+            continue;
+        }
+        if claimed.iter().any(|task| {
+            task.kind == "task"
+                && task.status.as_deref() == Some("in progress")
+                && task.id == record.id
+                && task.profile_id == record.profile_id
+                && task.updated_at == record.updated_at
+                && task.title == record.title
+                && task.content == record.content
+        }) {
+            record.status = Some("todo".into());
+            record.updated_at = now.max(record.updated_at + 1);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Applies an edit built from the stored record, under the store lock, so a
@@ -313,7 +405,8 @@ fn write_records(path: &PathBuf, records: &[SessionRecord]) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::{
-        read_records, validate, validate_all, write_records, SessionRecord, SessionRecordDraft,
+        claim_tasks, read_records, restore_tasks, validate, validate_all, write_records,
+        SessionRecord, SessionRecordDraft,
     };
 
     fn draft(kind: &str, title: &str, status: Option<&str>) -> SessionRecordDraft {
@@ -323,6 +416,93 @@ mod tests {
             content: "  code\n\n".to_owned(),
             status: status.map(str::to_owned),
         }
+    }
+
+    fn task(id: &str, profile: &str, status: &str) -> SessionRecord {
+        SessionRecord {
+            id: id.into(),
+            profile_id: profile.into(),
+            kind: "task".into(),
+            title: id.into(),
+            content: "  original\nrequirements".into(),
+            status: Some(status.into()),
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    #[test]
+    fn run_all_claims_only_todos_of_the_target_profile_in_display_order() {
+        let mut records = vec![
+            task("later", "p", "todo"),
+            task("done", "p", "done"),
+            task("active", "p", "in progress"),
+            task("other", "q", "todo"),
+            task("first", "p", "todo"),
+        ];
+        records[0].created_at = 10;
+        let claimed = claim_tasks(&mut records, "p", None, 20);
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "later"]
+        );
+        assert!(claimed
+            .iter()
+            .all(|item| item.status.as_deref() == Some("in progress") && item.updated_at == 20));
+        assert_eq!(records[1].status.as_deref(), Some("done"));
+        assert_eq!(records[2].updated_at, 2);
+        assert_eq!(records[3].status.as_deref(), Some("todo"));
+        assert_eq!(records[0].content, "  original\nrequirements");
+        assert!(
+            claim_tasks(&mut records, "p", None, 21).is_empty(),
+            "a second window cannot claim the same tasks"
+        );
+    }
+
+    #[test]
+    fn individual_claim_skips_notes_stale_records_and_other_profiles() {
+        let mut records = vec![
+            task("one", "p", "todo"),
+            task("two", "p", "todo"),
+            task("old", "p", "done"),
+            task("note", "p", "todo"),
+            task("other", "q", "todo"),
+        ];
+        records[3].kind = "note".into();
+        records[3].status = None;
+        let ids = ["two", "two", "old", "missing", "note", "other"].map(str::to_owned);
+        let claimed = claim_tasks(&mut records, "p", Some(&ids), 3);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, "two");
+        assert_eq!(records[0].status.as_deref(), Some("todo"));
+        assert!(claim_tasks(&mut records, "p", Some(&[]), 4).is_empty());
+    }
+
+    #[test]
+    fn failed_handoff_restores_only_unmodified_claims() {
+        let mut records = vec![
+            task("one", "p", "todo"),
+            task("two", "p", "todo"),
+            task("three", "p", "todo"),
+        ];
+        let claimed = claim_tasks(&mut records, "p", None, 10);
+        records[1].status = Some("done".into());
+        records[1].updated_at = 11;
+        records[2].content = "edited elsewhere".into();
+        records[2].updated_at = 11;
+        assert!(restore_tasks(&mut records, &claimed, 12));
+        assert_eq!(records[0].status.as_deref(), Some("todo"));
+        assert_eq!(records[0].updated_at, 12);
+        assert_eq!(records[1].status.as_deref(), Some("done"));
+        assert_eq!(records[2].status.as_deref(), Some("in progress"));
+        assert_eq!(records[2].content, "edited elsewhere");
+        assert!(
+            !restore_tasks(&mut records, &claimed, 13),
+            "repeated rollback must be a no-op"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
   import { TASK_STATUSES, validateRecordDraft, type SessionRecord, type TaskStatus } from '../domain/session-record';
 
   // Mount a new instance (keyed by profileId) when switching saved sessions.
-  let { profileId, sessionName, notesOnly = false, embedded = false, repository, revision = 0, syncNote = '', onChanged = () => {}, onClose = () => {} }: {
+  let { profileId, sessionName, notesOnly = false, embedded = false, repository, revision = 0, syncNote = '', onRunTasks, taskRunUnavailable = '', onChanged = () => {}, onClose = () => {} }: {
     profileId: string;
     sessionName: string;
     /** Rendered inline inside another panel, so it has no close button. */
@@ -15,6 +15,8 @@
     /** Changes when a sync replaced the local records, so the list reloads. */
     revision?: number;
     syncNote?: string;
+    onRunTasks?: (taskIds?: string[]) => Promise<void>;
+    taskRunUnavailable?: string;
     onChanged?: () => void;
     onClose?: () => void;
   } = $props();
@@ -22,6 +24,7 @@
   let records = $state<SessionRecord[]>([]);
   let loading = $state(true);
   let busy = $state(false);
+  let runningTasks = $state(false);
   let error = $state('');
   let kind = $state<'note' | 'task'>('note');
   let editing = $state<SessionRecord | null>(null);
@@ -33,14 +36,16 @@
   let disposed = false;
   const notes = $derived(records.filter((record) => record.kind === 'note'));
   const tasks = $derived(records.filter((record) => record.kind === 'task'));
+  const todoTasks = $derived(tasks.filter((record) => record.kind === 'task' && record.status === 'todo'));
+  const runUnavailable = $derived(taskRunUnavailable || (!onRunTasks ? 'Open these tasks from a connected session.' : ''));
 
   function message(cause: unknown): string {
     return cause instanceof Error ? cause.message : String(cause);
   }
 
-  async function refresh(): Promise<void> {
+  async function refresh(preserveError = false): Promise<void> {
     loading = true;
-    error = '';
+    if (!preserveError) error = '';
     try {
       const loaded = await repository.list(profileId);
       if (!disposed) records = loaded;
@@ -55,7 +60,7 @@
   $effect(() => {
     if (revision === seenRevision || editorOpen || busy) return;
     seenRevision = revision;
-    void refresh();
+    void refresh(true);
   });
 
   onMount(() => {
@@ -64,6 +69,7 @@
   });
 
   function edit(record: SessionRecord | null): void {
+    if (record) kind = record.kind;
     editing = record;
     title = record?.title ?? '';
     content = record?.content ?? '';
@@ -126,6 +132,23 @@
       if (!disposed) busy = false;
     }
   }
+
+  async function runTasks(taskIds?: string[]): Promise<void> {
+    if (busy || loading || runUnavailable || !onRunTasks) return;
+    busy = true;
+    runningTasks = true;
+    error = '';
+    deletingId = null;
+    try {
+      await onRunTasks(taskIds);
+      onChanged();
+      if (!disposed) await refresh();
+    } catch (cause) {
+      if (!disposed) error = message(cause);
+    } finally {
+      if (!disposed) { busy = false; runningTasks = false; }
+    }
+  }
 </script>
 
 <section class="records-panel" class:notes-only={notesOnly} class:embedded aria-label={notesOnly ? sessionName : `Notes and tasks for ${sessionName}`}>
@@ -146,6 +169,7 @@
     </div>
   </header>
   {#if error}<p class="record-error" role="alert">{error}</p>{/if}
+  {#if runningTasks}<p class="task-starting" role="status">Sending tasks to the AI agent…</p>{/if}
   {#if editorOpen}
     <form class="record-editor" onsubmit={save}>
       <div class="editor-heading">
@@ -198,12 +222,18 @@
       <section class="record-column task-column" aria-labelledby="tasks-heading">
         <div class="column-header">
           <div><span class="column-icon task-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2" /></svg></span><strong id="tasks-heading">Tasks</strong><span class="record-count">{tasks.length}</span></div>
-          <button class="add-button task-add" type="button" aria-label="Add task" title="Add task" disabled={busy} onclick={() => add('task')}><span aria-hidden="true">+</span></button>
+          <div class="task-controls">
+            <button class="play-button" type="button" aria-label={`Run all to-do tasks (${todoTasks.length})`} title={runUnavailable || (todoTasks.length ? 'Run all to-do tasks' : 'No to-do tasks to run')} disabled={busy || !todoTasks.length || Boolean(runUnavailable)} onclick={() => void runTasks()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5 3 8 5-8 5z" /></svg></button>
+            <button class="add-button task-add" type="button" aria-label="Add task" title="Add task" disabled={busy} onclick={() => add('task')}><span aria-hidden="true">+</span></button>
+          </div>
         </div>
         <div class="record-list">
           {#each tasks as record (record.id)}
             <article>
-              <div class="record-heading"><strong>{record.title}</strong><span class="record-status" data-status={record.status}>{statusLabel(record.status)}</span></div>
+              <div class="record-heading"><strong>{record.title}</strong><div class="task-controls">
+                {#if record.status === 'todo'}<button class="play-button task-play" type="button" aria-label={`Run task: ${record.title}`} title={runUnavailable || 'Run this task'} disabled={busy || Boolean(runUnavailable)} onclick={() => void runTasks([record.id])}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5 3 8 5-8 5z" /></svg></button>{/if}
+                <span class="record-status" data-status={record.status}>{statusLabel(record.status)}</span>
+              </div></div>
               {#if record.content}<p class="record-content">{record.content}</p>{/if}
               <div class="record-actions">
                 {#if deletingId === record.id}
@@ -228,6 +258,14 @@
 
 <style>
   .records-panel { display: flex; flex-direction: column; min-width: 0; min-height: 420px; color: #e7eee9; background: #101512; }
+  .records-panel:not(.embedded) { flex: 1; min-height: 0; overflow: hidden; }
+  .records-panel:not(.embedded) .record-columns { flex: 1; min-height: 0; grid-auto-rows: minmax(0, 1fr); overflow: hidden; }
+  .records-panel:not(.embedded) .record-column { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  .records-panel:not(.embedded) .record-list { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+  .records-panel:not(.embedded) .record-editor { min-height: 0; overflow-y: auto; }
+  .records-panel:not(.embedded) .loading-state { flex: 1; min-height: 0; }
+  .panel-header, .column-header, .record-error, .task-starting { flex-shrink: 0; }
+  .record-list > article, .record-list > .empty-state { flex-shrink: 0; }
   .embedded { min-height: 0; border-top: 1px solid #29352e; }
   .embedded .record-columns, .embedded .loading-state { min-height: 120px; }
   .embedded .record-list { max-height: 280px; overflow: auto; }
@@ -262,6 +300,11 @@
   .add-button span { font-size: 18px; font-weight: 350; line-height: 1; transform: translateY(-1px); }
   .add-button.task-add { color: #9bddff; border-color: #36586b; background: #14232b; }
   .add-button.task-add:hover:not(:disabled) { border-color: #70bfe8; background: #182c36; }
+  .task-controls { display: flex; flex: 0 0 auto; align-items: center; gap: 7px; }
+  .play-button { display: grid; place-items: center; width: 27px; height: 27px; padding: 0; border: 1px solid #3e674a; border-radius: 7px; color: #9af0b3; background: #15231a; }
+  .play-button svg { width: 13px; height: 13px; fill: currentColor; }
+  .play-button:hover:not(:disabled) { border-color: #73cc8c; background: #1a2c20; }
+  .task-play { width: 23px; height: 23px; border-radius: 6px; }
   .record-list { display: flex; flex-direction: column; gap: 8px; }
   article { padding: 12px; border: 1px solid #303b34; border-radius: 9px; background: #151c18; box-shadow: 0 2px 10px #0002; }
   article:hover { border-color: #405046; background: #18201b; }
@@ -283,6 +326,7 @@
   .empty-plus { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid #3d5e48; border-radius: 10px; color: #8eefaa; background: #16231a; font-size: 22px; font-weight: 300; }
   .task-empty .empty-plus { color: #8dd9ff; border-color: #36576a; background: #14232a; }
   .record-error { margin: 12px 16px 0; padding: 8px 10px; border: 1px solid #723c42; border-radius: 7px; color: #ffadb3; background: #2c171a; font-size: 10px; }
+  .task-starting { margin: 12px 16px 0; color: #9af0b3; font-size: 10px; }
   .loading-state { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 390px; color: #7f8c83; font-size: 10px; }
   .loading-state span { width: 12px; height: 12px; border: 2px solid #344239; border-top-color: #8eefaa; border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }

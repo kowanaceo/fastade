@@ -202,6 +202,19 @@ export class TauriDesktopClient implements DesktopClient {
     return invoke<void>('google_sign_out');
   }
 
+  async transcribeVoice(audio: Blob, language: '' | 'ko' | 'en', signal: AbortSignal): Promise<string> {
+    const bytes = new Uint8Array(await audio.arrayBuffer());
+    if (signal.aborted) throw new Error('cancelled');
+    const requestId = crypto.randomUUID();
+    const cancel = (): void => { void invoke('cancel_voice_transcription', { requestId }).catch(() => {}); };
+    signal.addEventListener('abort', cancel, { once: true });
+    try {
+      return await invoke<string>('transcribe_voice', { requestId, audio: Array.from(bytes), mimeType: audio.type, language });
+    } finally {
+      signal.removeEventListener('abort', cancel);
+    }
+  }
+
   syncSnapshot(): Promise<SyncSnapshot> {
     return invoke<SyncSnapshot>('sync_snapshot');
   }

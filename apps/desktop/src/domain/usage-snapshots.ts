@@ -1,7 +1,7 @@
 import type { AgentAccount, AgentUsage, UsageSnapshot, UsageWindow } from './session.ts';
 
-/** A snapshot is re-uploaded when its numbers change, or at least this often
- * so other devices can tell the host is still being watched. */
+/** New provider samples with unchanged limits are uploaded at this interval.
+ * Re-uploading must never make cached samples appear newly collected. */
 export const SNAPSHOT_REFRESH_SECONDS = 20 * 60;
 /** A snapshot older than this is shown as stale rather than current. */
 export const SNAPSHOT_STALE_SECONDS = 30 * 60;
@@ -11,18 +11,34 @@ export function localHostId(deviceId: string | null): string {
   return `device-${(deviceId ?? 'local').replace(/[^A-Za-z0-9._-]/g, '-')}`;
 }
 
-export function localSnapshot(agentId: string, usage: AgentUsage | undefined, deviceId: string | null, now: number, accountId?: string): UsageSnapshot | null {
-  if (!usage || usage.status !== 'available' || !usage.windows.length) return null;
-  return { agentId, hostId: localHostId(deviceId), hostLabel: 'This device', accountId, collectedAt: now, windows: usage.windows };
+export function localSnapshot(agentId: string, usage: AgentUsage | undefined, deviceId: string | null): UsageSnapshot | null {
+  if (!usage || usage.status !== 'available' || !usage.windows.length
+    || !Number.isSafeInteger(usage.collectedAt) || usage.collectedAt! <= 0) return null;
+  return { agentId, hostId: localHostId(deviceId), hostLabel: 'This device',
+    ...(usage.accountId ? { accountId: usage.accountId, ...(usage.accountEmail ? { accountEmail: usage.accountEmail } : {}) } : {}),
+    collectedAt: usage.collectedAt!, windows: usage.windows.map(snapshotWindow) };
+}
+
+/** Build the wire shape explicitly: never send optional reset fields as null. */
+function snapshotWindow(window: UsageWindow): UsageWindow {
+  const { label, remainingPercent, resetsAt, resetText } = window;
+  return { label, remainingPercent,
+    ...(Number.isSafeInteger(resetsAt) && resetsAt! >= 0 ? { resetsAt } : resetText?.trim() ? { resetText } : {}) };
 }
 
 /** What the server would learn from a snapshot, ignoring when it was taken. */
 export function windowsKey(windows: UsageWindow[]): string {
-  return JSON.stringify(windows.map((window) => [window.label, window.remainingPercent, window.resetsAt ?? null]));
+  return JSON.stringify(windows.map((window) => [window.label, window.remainingPercent, window.resetsAt ?? null, window.resetText ?? null]));
 }
 
-export function shouldUpload(previous: { key: string; at: number } | undefined, snapshot: UsageSnapshot, now: number): boolean {
-  return !previous || previous.key !== windowsKey(snapshot.windows) || now - previous.at >= SNAPSHOT_REFRESH_SECONDS;
+/** Include public account metadata without weakening the timestamp guard. */
+export function snapshotKey(snapshot: UsageSnapshot): string {
+  return JSON.stringify([snapshot.accountEmail ?? null, windowsKey(snapshot.windows)]);
+}
+
+export function shouldUpload(previous: { key: string; at: number; collectedAt: number } | undefined, snapshot: UsageSnapshot, now: number): boolean {
+  if (previous && snapshot.collectedAt < previous.collectedAt) return false;
+  return !previous || previous.key !== snapshotKey(snapshot) || now - previous.at >= SNAPSHOT_REFRESH_SECONDS;
 }
 
 /** The server answers with a bare list or `{ snapshots: [...] }`; anything
@@ -36,7 +52,7 @@ export function parseSnapshotList(raw: unknown): UsageSnapshot[] {
       || typeof value.collectedAt !== 'number' || !Array.isArray(value.windows)) return [];
     const windows = value.windows.filter((window): window is UsageWindow =>
       !!window && typeof window.label === 'string' && typeof window.remainingPercent === 'number');
-    return [{ agentId: value.agentId, hostId: value.hostId, hostLabel: typeof value.hostLabel === 'string' && value.hostLabel ? value.hostLabel : value.hostId, accountId: typeof value.accountId === 'string' && value.accountId ? value.accountId : undefined, collectedAt: value.collectedAt, windows }];
+    return [{ agentId: value.agentId, hostId: value.hostId, hostLabel: typeof value.hostLabel === 'string' && value.hostLabel ? value.hostLabel : value.hostId, accountId: typeof value.accountId === 'string' && value.accountId ? value.accountId : undefined, accountEmail: typeof value.accountId === 'string' && value.accountId && typeof value.accountEmail === 'string' && value.accountEmail.trim() ? value.accountEmail : undefined, collectedAt: value.collectedAt, windows }];
   });
 }
 
