@@ -102,6 +102,7 @@ button.upload { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #3e5f49; bor
 
 button.upload:has(.records-icon) { position: relative; }
 .records-icon { display: block; width: 13px; height: 13px; }
+.voice-icon { display: block; width: 12px; height: 12px; }
 .task-badge { position: absolute; top: -6px; right: -6px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px; box-sizing: border-box; color: #0c110e; background: #8eefaa; font-size: 9px; font-weight: 800; line-height: 14px; text-align: center; }
 .session-select .task-count { display: inline-block; min-width: 14px; height: 14px; margin-left: 6px; padding: 0 4px; border-radius: 7px; box-sizing: border-box; color: #0c110e; background: #8eefaa; font-size: 9px; font-weight: 800; line-height: 14px; text-align: center; vertical-align: 1px; }
 
