@@ -726,14 +726,19 @@ fn parse_absolute_reset<T: chrono::TimeZone>(
         None => NaiveTime::from_hms_opt(0, 0, 0)?,
     };
 
-    // Without a date use the collection date in that timezone. Do not roll
-    // an elapsed reset into tomorrow or a later cycle. Ambiguous/nonexistent
-    // DST times fall back to the original text rather than guessing.
-    Some(
+    // Without a date, `/usage` prints the next occurrence of that clock time,
+    // so a time already past today (e.g. "resets 1am" at 11pm) is tomorrow's.
+    // Ambiguous/nonexistent DST times fall back to the original text.
+    let resolve = |date: chrono::NaiveDate| {
         zone.from_local_datetime(&date.and_time(time))
-            .single()?
-            .timestamp(),
-    )
+            .single()
+            .map(|at| at.timestamp())
+    };
+    let at = resolve(date)?;
+    if date_part.is_none() && at <= collected_at {
+        return resolve(date.succ_opt()?);
+    }
+    Some(at)
 }
 
 fn parse_clock_time(text: &str) -> Option<chrono::NaiveTime> {
@@ -1435,11 +1440,11 @@ mod tests {
     }
 
     #[test]
-    fn absolute_resets_use_the_printed_zone_and_never_roll_expired_times_forward() {
+    fn absolute_resets_use_the_printed_zone_and_roll_only_time_only_resets_forward() {
         let collected_at = epoch("2026-10-22T15:00:00Z");
         for (text, expected) in [
             ("Resets 7pm (Asia/Seoul)", "2026-10-23T10:00:00Z"),
-            ("Resets 3:30am (Asia/Kuala_Lumpur)", "2026-10-21T19:30:00Z"),
+            ("Resets 3:30am (Asia/Kuala_Lumpur)", "2026-10-22T19:30:00Z"),
             (
                 "Resets Oct 26 at 7:59pm (Asia/Seoul)",
                 "2026-10-26T10:59:00Z",
