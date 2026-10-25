@@ -946,9 +946,20 @@ pub fn get_local_accounts() -> Vec<AgentAccount> {
 /// the desktop app runs this over its ordinary ssh exec, so the host stores
 /// nothing and holds no credential.
 const REMOTE_ACCOUNT_PYTHON: &str = include_str!("remote/usage_account.py");
+const REMOTE_CLAUDE_USAGE_PYTHON: &str = include_str!("remote/claude_usage.py");
 const REMOTE_CODEX_LOG_SCRIPT: &str = r#"h="${CODEX_HOME:-$HOME/.codex}"; d="$h/sessions"; [ -d "$d" ] || exit 0; find "$d" -name 'rollout-*.jsonl' -type f 2>/dev/null | sort -r | head -8 | while IFS= read -r f; do l=$(tail -c 262144 "$f" | grep '"rate_limits"' | tail -1); if [ -n "$l" ]; then printf '%s\n' "$l"; break; fi; done"#;
 
 fn remote_account_probe() -> String {
+    remote_account_probe_for("codex")
+}
+
+fn remote_account_probe_for(agent: &str) -> String {
+    if agent == "claude" {
+        return format!(
+            "if command -v python3 >/dev/null 2>&1; then python3 -c {} claude 2>/dev/null; fi",
+            crate::session::shell_quote(REMOTE_ACCOUNT_PYTHON),
+        );
+    }
     format!(
         "if command -v python3 >/dev/null 2>&1; then python3 -c {} codex 2>/dev/null; else {}; fi",
         crate::session::shell_quote(REMOTE_ACCOUNT_PYTHON),
@@ -1010,41 +1021,32 @@ fn remote_host_label(app: &tauri::AppHandle, endpoint: &str) -> String {
         .unwrap_or_else(|| endpoint.to_owned())
 }
 
-/// Codex limits for every SSH host with a live session. Claude's limits are
-/// not in its logs, so a remote Claude has nothing to report here.
+static REMOTE_CLAUDE_CACHE: Mutex<Vec<(String, Instant, UsageSnapshot)>> = Mutex::new(Vec::new());
+
+/// Codex limits (from its logs) and Claude limits (from `/usage` run in a
+/// PTY on the host) for every SSH host with a live session. Claude's limits
+/// are not in its logs, so the host needs python3 and a signed-in `claude`.
 #[tauri::command]
 pub async fn get_remote_usage(
+    force: Option<bool>,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<Vec<UsageSnapshot>, String> {
     let endpoints = crate::session::running_remote_endpoints(&state);
+    let force = force.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let workers: Vec<_> = endpoints
             .into_iter()
-            .map(|endpoint| {
-                let app = app.clone();
-                thread::spawn(move || {
-                    let probe = remote_account_probe();
-                    let script = format!("{probe}; {REMOTE_CODEX_LOG_SCRIPT}");
-                    let output =
-                        crate::remote_fs::run_remote_script(&endpoint, &script, &app).ok()?;
-                    let account = remote_account(&output);
-                    let after =
-                        crate::remote_fs::run_remote_script(&endpoint, &probe, &app).ok()?;
-                    if account != remote_account(&after) {
-                        return None;
-                    }
-                    let (windows, collected_at) = codex_usage_from_log(&output)?;
-                    Some(UsageSnapshot {
-                        agent_id: "codex".to_owned(),
-                        host_id: remote_host_id(&endpoint),
-                        host_label: remote_host_label(&app, &endpoint),
-                        account_id: account.as_ref().map(|a| a.account_id.clone()),
-                        account_email: account.and_then(|a| a.label),
-                        collected_at,
-                        windows,
-                    })
-                })
+            .flat_map(|endpoint| {
+                let codex = {
+                    let (endpoint, app) = (endpoint.clone(), app.clone());
+                    thread::spawn(move || remote_codex_snapshot(&endpoint, &app))
+                };
+                let claude = {
+                    let app = app.clone();
+                    thread::spawn(move || remote_claude_snapshot(&endpoint, &app, force))
+                };
+                [codex, claude]
             })
             .collect();
         Ok(workers
@@ -1054,6 +1056,83 @@ pub async fn get_remote_usage(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn remote_codex_snapshot(endpoint: &str, app: &tauri::AppHandle) -> Option<UsageSnapshot> {
+    let probe = remote_account_probe();
+    let script = format!("{probe}; {REMOTE_CODEX_LOG_SCRIPT}");
+    let output = crate::remote_fs::run_remote_script(endpoint, &script, app).ok()?;
+    let account = remote_account(&output);
+    let after = crate::remote_fs::run_remote_script(endpoint, &probe, app).ok()?;
+    if account != remote_account(&after) {
+        return None;
+    }
+    let (windows, collected_at) = codex_usage_from_log(&output)?;
+    Some(UsageSnapshot {
+        agent_id: "codex".to_owned(),
+        host_id: remote_host_id(endpoint),
+        host_label: remote_host_label(app, endpoint),
+        account_id: account.as_ref().map(|a| a.account_id.clone()),
+        account_email: account.and_then(|a| a.label),
+        collected_at,
+        windows,
+    })
+}
+
+fn remote_claude_snapshot(
+    endpoint: &str,
+    app: &tauri::AppHandle,
+    force: bool,
+) -> Option<UsageSnapshot> {
+    if !force {
+        let cache = REMOTE_CLAUDE_CACHE.lock().ok()?;
+        let cached = cache.iter().find(|(key, _, _)| key == endpoint);
+        if let Some((_, at, snapshot)) = cached {
+            let reset = snapshot
+                .windows
+                .iter()
+                .any(|window| window.resets_at.is_some_and(|at| at <= now_unix()));
+            if at.elapsed() < CLAUDE_CACHE_TTL && !reset {
+                return Some(snapshot.clone());
+            }
+        }
+    }
+    let probe = remote_account_probe_for("claude");
+    let script = format!(
+        "{probe}; if command -v python3 >/dev/null 2>&1; then python3 -c {}; fi",
+        crate::session::shell_quote(REMOTE_CLAUDE_USAGE_PYTHON),
+    );
+    let output = crate::remote_fs::run_remote_script(endpoint, &script, app).ok()?;
+    let collected_at = now_unix();
+    let account = remote_account(&output)?;
+    let after = crate::remote_fs::run_remote_script(endpoint, &probe, app).ok()?;
+    if Some(&account) != remote_account(&after).as_ref() {
+        return None;
+    }
+    let encoded = output
+        .lines()
+        .find_map(|line| line.strip_prefix("CLAUDE_USAGE_B64 "))?;
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim()).ok()?;
+    let text = terminal_text(&String::from_utf8_lossy(&bytes));
+    let usage = parse_claude_usage_at(&text, collected_at);
+    if usage.windows.is_empty() {
+        return None;
+    }
+    let snapshot = UsageSnapshot {
+        agent_id: "claude".to_owned(),
+        host_id: remote_host_id(endpoint),
+        host_label: remote_host_label(app, endpoint),
+        account_id: Some(account.account_id),
+        account_email: account.label,
+        collected_at,
+        windows: usage.windows,
+    };
+    if let Ok(mut cache) = REMOTE_CLAUDE_CACHE.lock() {
+        cache.retain(|(key, _, _)| key != endpoint);
+        cache.push((endpoint.to_owned(), Instant::now(), snapshot.clone()));
+    }
+    Some(snapshot)
 }
 
 #[cfg(test)]
