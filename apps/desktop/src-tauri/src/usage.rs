@@ -216,8 +216,8 @@ fn codex_log_usage(root: &Path) -> Option<(Vec<UsageWindow>, i64)> {
         .max_by_key(|(_, written)| *written)
 }
 
-/// The last `token_count` event's rate limits in `text` (a log tail, or the
-/// one line a remote host sends back), as windows plus when it was written.
+/// The last `token_count` event's rate limits in a log tail, as windows plus
+/// when it was written.
 /// Expired reset instants are preserved so consumers can identify stale limits.
 fn codex_usage_from_log(text: &str) -> Option<(Vec<UsageWindow>, i64)> {
     let event = text.lines().rev().find_map(|line| {
@@ -947,12 +947,10 @@ pub fn get_local_accounts() -> Vec<AgentAccount> {
         .collect()
 }
 
-/// Prints the newest Codex limits line on a host. A unix socket is not needed:
-/// the desktop app runs this over its ordinary ssh exec, so the host stores
-/// nothing and holds no credential.
+/// Helpers run over ordinary SSH exec using the host's existing CLI login.
 const REMOTE_ACCOUNT_PYTHON: &str = include_str!("remote/usage_account.py");
 const REMOTE_CLAUDE_USAGE_PYTHON: &str = include_str!("remote/claude_usage.py");
-const REMOTE_CODEX_LOG_SCRIPT: &str = r#"h="${CODEX_HOME:-$HOME/.codex}"; d="$h/sessions"; [ -d "$d" ] || exit 0; find "$d" -name 'rollout-*.jsonl' -type f 2>/dev/null | sort -r | head -8 | while IFS= read -r f; do l=$(tail -c 262144 "$f" | grep '"rate_limits"' | tail -1); if [ -n "$l" ]; then printf '%s\n' "$l"; break; fi; done"#;
+const REMOTE_CODEX_USAGE_PYTHON: &str = include_str!("remote/codex_usage.py");
 
 fn remote_account_probe() -> String {
     remote_account_probe_for("codex")
@@ -1028,9 +1026,9 @@ fn remote_host_label(app: &tauri::AppHandle, endpoint: &str) -> String {
 
 static REMOTE_CLAUDE_CACHE: Mutex<Vec<(String, Instant, UsageSnapshot)>> = Mutex::new(Vec::new());
 
-/// Codex limits (from its logs) and Claude limits (from `/usage` run in a
-/// PTY on the host) for every SSH host with a live session. Claude's limits
-/// are not in its logs, so the host needs python3 and a signed-in `claude`.
+/// Current Codex limits (from app-server) and Claude limits (from `/usage`
+/// run in a PTY on the host) for every SSH host with a live session.
+/// Both collectors require python3 and a signed-in CLI on the host.
 #[tauri::command]
 pub async fn get_remote_usage(
     force: Option<bool>,
@@ -1065,14 +1063,20 @@ pub async fn get_remote_usage(
 
 fn remote_codex_snapshot(endpoint: &str, app: &tauri::AppHandle) -> Option<UsageSnapshot> {
     let probe = remote_account_probe();
-    let script = format!("{probe}; {REMOTE_CODEX_LOG_SCRIPT}");
+    // Logs may not receive a token_count event just by opening Codex, and
+    // resumed sessions can live in old date folders. Query the account on
+    // every refresh rather than repeatedly publishing an old log sample.
+    let script = format!(
+        "{probe}; if command -v python3 >/dev/null 2>&1; then python3 -c {}; fi",
+        crate::session::shell_quote(REMOTE_CODEX_USAGE_PYTHON),
+    );
     let output = crate::remote_fs::run_remote_script(endpoint, &script, app).ok()?;
     let account = remote_account(&output);
     let after = crate::remote_fs::run_remote_script(endpoint, &probe, app).ok()?;
     if account != remote_account(&after) {
         return None;
     }
-    let (windows, collected_at) = codex_usage_from_log(&output)?;
+    let (windows, collected_at) = remote_codex_usage(&output)?;
     Some(UsageSnapshot {
         agent_id: "codex".to_owned(),
         host_id: remote_host_id(endpoint),
@@ -1082,6 +1086,19 @@ fn remote_codex_snapshot(endpoint: &str, app: &tauri::AppHandle) -> Option<Usage
         collected_at,
         windows,
     })
+}
+
+fn remote_codex_usage(output: &str) -> Option<(Vec<UsageWindow>, i64)> {
+    let encoded = output
+        .lines()
+        .find_map(|line| line.strip_prefix("CODEX_USAGE_JSON "))?;
+    let response: Value = serde_json::from_str(encoded).ok()?;
+    let collected_at = response.get("collectedAt")?.as_i64().filter(|at| *at > 0)?;
+    let limits = response.get("rateLimits")?;
+    let mut windows = Vec::new();
+    append_window(&mut windows, "5h", &limits["primary"], collected_at);
+    append_window(&mut windows, "Week", &limits["secondary"], collected_at);
+    (!windows.is_empty()).then_some((windows, collected_at))
 }
 
 fn remote_claude_snapshot(
@@ -1399,12 +1416,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires local Codex session logs; verifies the remote script on this machine's sh"]
+    #[ignore = "requires a locally installed and logged-in Codex CLI; verifies the remote collector locally"]
     fn remote_script_prints_a_parsable_line() {
         let script = format!(
-            "{}; {}",
+            "{}; python3 -c {}",
             super::remote_account_probe(),
-            super::REMOTE_CODEX_LOG_SCRIPT
+            crate::session::shell_quote(super::REMOTE_CODEX_USAGE_PYTHON)
         );
         let output = std::process::Command::new("sh")
             .args(["-c", &script])
@@ -1412,7 +1429,35 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(super::remote_account(&text).is_some());
-        assert!(codex_usage_from_log(&text).is_some());
+        assert!(super::remote_codex_usage(&text).is_some());
+    }
+
+    #[test]
+    fn remote_codex_uses_live_limits_and_response_time_instead_of_old_logs() {
+        let live = serde_json::json!({
+            "collectedAt": 1_793_000_000_i64,
+            "rateLimits": {
+                "primary": {"usedPercent": 0, "resetsAt": 1_793_018_000_i64},
+                "secondary": {"usedPercent": 0, "resetsAt": 1_793_600_000_i64}
+            }
+        });
+        let output = format!("ACCOUNT legacy-id\n{LOG}\nCODEX_USAGE_JSON {live}\n");
+        let (windows, collected_at) = super::remote_codex_usage(&output).unwrap();
+        assert_eq!(collected_at, 1_793_000_000);
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|window| window.remaining_percent == 100));
+        assert_eq!(windows[0].resets_at, Some(1_793_018_000));
+        assert_eq!(windows[1].resets_at, Some(1_793_600_000));
+        // A failed live query cannot relabel stale log data as current.
+        assert!(super::remote_codex_usage(LOG).is_none());
+        for value in [
+            r#"{"collectedAt":0,"rateLimits":{"primary":{"usedPercent":0}}}"#,
+            r#"{"rateLimits":{"primary":{"usedPercent":0}}}"#,
+            r#"{"collectedAt":1000,"rateLimits":{}}"#,
+            "not json",
+        ] {
+            assert!(super::remote_codex_usage(&format!("CODEX_USAGE_JSON {value}")).is_none());
+        }
     }
 
     #[test]
