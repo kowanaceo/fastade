@@ -220,7 +220,15 @@ fn report_activity(state: &str, payload: Option<&str>) {
         "provider_session_id": provider_session_id,
         "effective_model": effective_model,
     });
-    let _ = send_to_app(&request);
+    // CLIs wait for hook commands to exit, so a busy or wedged app must not
+    // be able to stall the agent's turn: give up quickly instead.
+    let _ = send_to_app_with_timeout(&request, Some(ACTIVITY_REPORT_TIMEOUT));
+}
+
+const ACTIVITY_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn send_to_app(request: &Value) -> Result<Value, String> {
+    send_to_app_with_timeout(request, None)
 }
 
 fn read_effective_model(path: &str) -> Option<String> {
@@ -249,7 +257,10 @@ fn read_effective_model(path: &str) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn send_to_app(request: &Value) -> Result<Value, String> {
+fn send_to_app_with_timeout(
+    request: &Value,
+    timeout: Option<std::time::Duration>,
+) -> Result<Value, String> {
     use std::os::unix::net::UnixStream;
 
     // A remote host reaches the desktop app through an ssh-forwarded socket
@@ -261,6 +272,10 @@ fn send_to_app(request: &Value) -> Result<Value, String> {
     };
     let mut stream = UnixStream::connect(&path)
         .map_err(|_| "the fastade desktop app is not running".to_owned())?;
+    stream
+        .set_read_timeout(timeout)
+        .and_then(|()| stream.set_write_timeout(timeout))
+        .map_err(|error| error.to_string())?;
     let mut payload = request.to_string();
     payload.push('\n');
     stream
@@ -276,7 +291,10 @@ fn send_to_app(request: &Value) -> Result<Value, String> {
 }
 
 #[cfg(not(unix))]
-fn send_to_app(_request: &Value) -> Result<Value, String> {
+fn send_to_app_with_timeout(
+    _request: &Value,
+    _timeout: Option<std::time::Duration>,
+) -> Result<Value, String> {
     Err("the fastade MCP bridge is only available on macOS/Linux today".to_owned())
 }
 

@@ -22,3 +22,14 @@ test('server QR links encode optional password and key', () => {
   assert.equal(params.key, 'QUJD-_');
   assert.equal(params.name, 'dev & test');
 });
+
+test('server QR links add the jump host only when there is one', () => {
+  const jump = { host: 'backend.example.com', port: 22, user: 'phone' };
+  const params = Object.fromEntries(new URL(serverQrPayload({ ...server, host: 'localhost', port: 30000, jump })).searchParams);
+  assert.equal(params.host, 'localhost');
+  assert.equal(params.port, '30000');
+  assert.equal(params.jump_host, 'backend.example.com');
+  assert.equal(params.jump_port, '22');
+  assert.equal(params.jump_user, 'phone');
+  assert.doesNotMatch(serverQrPayload({ ...server, jump: null }), /jump/);
+});

@@ -103,6 +103,8 @@ pub struct SessionSummary {
     pub last_models: HashMap<String, AgentModelInfo>,
     pub endpoint: String,
     pub project_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     pub status: SessionStatus,
     /// Popup shells belong to their originating window and never survive a restart.
     #[serde(skip)]
@@ -196,6 +198,8 @@ pub struct CreateSessionInput {
     endpoint: String,
     project_path: String,
     #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
     temporary: bool,
 }
 
@@ -254,6 +258,11 @@ pub fn create_session(
     window: tauri::Window,
 ) -> Result<SessionSummary, String> {
     validate_input(&input)?;
+    let profile_id = input.profile_id.or_else(|| {
+        crate::saved_sessions::list_saved_sessions(app.clone()).ok()?.into_iter()
+            .find(|profile| profile.device_paths.get(&input.endpoint) == Some(&input.project_path))
+            .map(|profile| profile.id)
+    });
     let session = SessionSummary {
         id: Uuid::new_v4().to_string(),
         title: input.title,
@@ -263,6 +272,7 @@ pub fn create_session(
         last_models: HashMap::new(),
         endpoint: input.endpoint,
         project_path: input.project_path,
+        profile_id,
         status: SessionStatus::Running,
         temporary_owner: input.temporary.then(|| window.label().to_owned()),
     };
@@ -520,6 +530,7 @@ pub fn reconnect_session(
         return Err("session is already running".to_owned());
     }
 
+    let profiles = crate::saved_sessions::list_saved_sessions(app.clone())?;
     let session = {
         let mut sessions = state
             .sessions
@@ -529,6 +540,9 @@ pub fn reconnect_session(
             .iter_mut()
             .find(|session| session.id == session_id)
             .ok_or_else(|| "session not found".to_owned())?;
+        if session.profile_id.is_none() {
+            session.profile_id = profiles.iter().find(|p| p.device_paths.get(&session.endpoint) == Some(&session.project_path)).map(|p| p.id.clone());
+        }
         session.status = SessionStatus::Running;
         session.clone()
     };
@@ -551,6 +565,39 @@ pub fn reconnect_session(
     }
     persist_sessions(&state)?;
     Ok(session)
+}
+
+/// Preflight the real remote shell, rather than trusting a window's cached
+/// badge. A running or suspended agent must never receive a launch command.
+#[tauri::command]
+pub async fn launch_session_agent(
+    session_id: String,
+    cli: CliKind,
+    command: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    let session = state.sessions.lock().map_err(|_| "session store is unavailable".to_owned())?
+        .iter().find(|s| s.id == session_id).cloned().ok_or("session not found")?;
+    let result = if session.endpoint != "local" {
+        let remote = session.clone();
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || crate::remote_shell::run(&app, &remote.endpoint,
+            serde_json::json!({"action":"launch", "runtimeId":remote.id, "cli":cli})))
+            .await.map_err(|e| e.to_string())??
+    } else {
+        serde_json::json!({"action":"direct", "cli":cli})
+    };
+    match result["action"].as_str() {
+        Some("direct") => write_bytes(&session_id, &format!("{command}\r"), &state)?,
+        Some("resumeDirect") => {
+            let kind = result["cli"].as_str().ok_or("Unknown agent")?;
+            if !["codex", "claude", "gemini"].contains(&kind) { return Err("Unknown agent".into()); }
+            write_bytes(&session_id, &format!("fg %?{kind}\r"), &state)?;
+        }
+        _ => {}
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -826,19 +873,11 @@ fn build_command(
         command.arg(&session.endpoint);
         None
     };
-    let enter = (session.project_path != "~")
-        .then(|| format!("cd -- {} && ", shell_quote(&session.project_path)))
-        .unwrap_or_default();
-    if let Some(remote) = remote_socket {
-        // `env` rather than `export`, which not every login shell has.
-        command.arg(format!(
-            "{enter}exec env FASTADE_SESSION_ID={} FASTADE_SOCK={} \"${{SHELL:-/bin/sh}}\" -l",
-            shell_quote(&session.id),
-            shell_quote(&remote)
-        ));
-    } else if session.project_path != "~" {
-        command.arg(format!("{enter}exec \"${{SHELL:-/bin/sh}}\" -l"));
-    }
+    let bridge_env = remote_socket.map(|remote| format!(" FASTADE_SOCK={}", shell_quote(&remote))).unwrap_or_default();
+    let helper = crate::remote_shell::helper_command(serde_json::json!({
+        "action":"connect", "directory":session.project_path, "runtimeId":session.id
+    }));
+    command.arg(format!("exec env FASTADE_SESSION_ID={}{} {helper}", shell_quote(&session.id), bridge_env));
     Ok((command, password))
 }
 
@@ -1372,6 +1411,7 @@ mod tests {
             last_models: HashMap::new(),
             endpoint: endpoint.to_owned(),
             project_path: project_path.to_owned(),
+            profile_id: None,
             status: SessionStatus::Running,
             temporary_owner: None,
         }
@@ -1469,6 +1509,7 @@ mod tests {
             last_models: HashMap::new(),
             endpoint: "local".to_owned(),
             project_path: "/active".to_owned(),
+            profile_id: None,
             status: SessionStatus::Running,
             temporary_owner: None,
         }];
@@ -1492,8 +1533,9 @@ mod tests {
 
     #[test]
     fn remote_home_starts_bare_login_shell() {
+        let argv = argv(&session("kowanas.dev", "~"));
         assert_eq!(
-            argv(&session("kowanas.dev", "~")),
+            argv[..9],
             [
                 "ssh",
                 "-tt",
@@ -1525,10 +1567,8 @@ mod tests {
                 "kowanas.dev"
             ]
         );
-        assert_eq!(
-            argv[9],
-            "cd -- '/root/my app' && exec \"${SHELL:-/bin/sh}\" -l"
-        );
+        assert!(argv[9].starts_with("exec env FASTADE_SESSION_ID='test' python3 -c "));
+        assert!(argv[9].contains("\"directory\":\"/root/my app\""));
     }
 
     #[test]
@@ -1552,9 +1592,9 @@ mod tests {
         );
         assert!(argv.contains(&"StreamLocalBindUnlink=yes".to_owned()));
         let remote = argv.last().unwrap();
-        assert!(remote.starts_with("cd -- '/root/my app' && exec env FASTADE_SESSION_ID="));
+        assert!(remote.starts_with("exec env FASTADE_SESSION_ID="));
         assert!(remote.contains(&format!("FASTADE_SOCK='/tmp/fastade-{}.sock'", remote_session.id)));
-        assert!(remote.ends_with("\"${SHELL:-/bin/sh}\" -l"));
+        assert!(remote.contains("python3 -c "));
 
         // Even a bare home session needs the environment to reach the bridge.
         let (home, _) = build_command(&session("kowanas.dev", "~"), None, Some(std::path::Path::new("/s"))).unwrap();
@@ -1585,7 +1625,7 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
             .collect();
         assert_eq!(
-            argv,
+            argv[..13],
             [
                 "ssh",
                 "-tt",
@@ -1602,6 +1642,7 @@ mod tests {
                 "deploy@1.2.3.4"
             ]
         );
+        assert!(argv[13].starts_with("exec env FASTADE_SESSION_ID='test' python3 -c "));
         assert!(password.is_none());
     }
 

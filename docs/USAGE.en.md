@@ -36,6 +36,8 @@ Matched top to bottom, most specific first — pressing Esc while renaming a gro
 
 **Pop-out and reconnect** — The ↗ button on a session card pops it into its own window. Session history and metadata are restored even after closing and reopening the app, and a closed session can be reconnected with ↻.
 
+**Desktop tunnel (macOS)** — In Settings → Desktop tunnel, save the backend SSH host and dedicated key, then enable the toggle. Sign-in and Remote Login (sshd) on the Mac are required. The server-assigned backend localhost port forwards to the Mac's SSH service. The app reconnects with backoff, prevents idle sleep while connected, and stops/reports off on OFF, logout or app exit. See [setup and verification](DESKTOP-TUNNEL.md). The mobile jump connection and sharing an existing terminal screen are separate features.
+
 ## Tips and troubleshooting
 
 **Run tasks** — Each **To do** task has a ▶ button. The ▶ immediately left of **Tasks → +** runs all current to-do tasks for that session together, in display order. The request goes to the AI in the session where you opened the task panel. If the shell has no AI running, fastade starts the most recently used enabled CLI, or the first enabled CLI, using its default model setting. A running AI must show **Ready** before submitting tasks. Selected tasks change to **In progress**; a failed handoff restores unchanged task statuses. When fastade MCP record tools are available, the executing agent updates tasks to **Done** after implementing and verifying them. Enable the CLI's MCP integration to allow those completion updates. See [task execution details](TASK-EXECUTION.md).

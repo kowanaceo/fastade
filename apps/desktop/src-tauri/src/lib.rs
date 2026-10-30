@@ -5,11 +5,14 @@ mod model_metadata;
 mod records;
 mod remote_fs;
 mod remote_mcp;
+mod remote_shell;
 mod saved_sessions;
 mod servers;
 mod session;
 mod ssh_config;
 mod stt;
+mod phone;
+mod tunnel;
 mod usage;
 mod windows;
 
@@ -65,6 +68,7 @@ pub fn run() {
         .setup(|app| {
             let state = AppState::load(app.handle()).map_err(std::io::Error::other)?;
             app.manage(state);
+            app.manage(tunnel::TunnelManager::start(app.handle().clone())?);
             mcp::start(app.handle().clone());
             watch_display_changes(app.handle());
             Ok(())
@@ -88,6 +92,7 @@ pub fn run() {
             interrupt_session,
             reconnect_session,
             close_session,
+            session::launch_session_agent,
             list_ssh_hosts,
             get_ssh_host_qr,
             list_remote_directory,
@@ -115,6 +120,12 @@ pub fn run() {
             google_sign_out,
             stt::transcribe_voice,
             stt::cancel_voice_transcription,
+            tunnel::tunnel_status,
+            tunnel::save_tunnel_settings,
+            tunnel::set_tunnel_enabled,
+            phone::create_phone_qr,
+            phone::list_phone_keys,
+            phone::revoke_phone_key,
             sync_snapshot,
             sync_changes,
             sync_push,
@@ -127,6 +138,23 @@ pub fn run() {
             list_all_session_records,
             replace_session_records
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run fastade");
+        .build(tauri::generate_context!())
+        .expect("failed to build fastade")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                let manager = app.state::<tunnel::TunnelManager>().inner().clone();
+                if manager.exit_ready() {
+                    return;
+                }
+                api.prevent_exit();
+                if manager.begin_shutdown() {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        manager.stop().await;
+                        manager.finish_shutdown();
+                        app.exit(code.unwrap_or(0));
+                    });
+                }
+            }
+        });
 }

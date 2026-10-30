@@ -207,6 +207,7 @@ export class AppViewModel {
   private readonly terminalSinks = new Map<string, Set<TerminalSink>>();
   private readonly terminalWrites = new Map<string, Promise<void>>();
   private readonly taskDispatches = new Set<string>();
+  private readonly agentLaunches = new Set<string>();
   private readonly hookInstalledSessionIds = new Set<string>();
   /** First directory each shell reported after opening at `~` — the device's
    * real home path (e.g. /root), so it can be told apart from a chosen folder. */
@@ -353,7 +354,7 @@ export class AppViewModel {
   }
 
   profileForSession(session: SessionSummary): SavedSessionProfile | undefined {
-    const mappedId = this.sessionProfileIds[session.id];
+    const mappedId = session.profileId ?? this.sessionProfileIds[session.id];
     return this.savedSessions.find((profile) => profile.id === mappedId)
       ?? this.savedSessions.find((profile) => this.matchesProfile(session, profile));
   }
@@ -707,7 +708,7 @@ export class AppViewModel {
   /** Opens a shell on the picked server. With no explicit folder it starts
    * at the server's home; the folder can be changed from the session header
    * afterwards, and that is also what names the session. */
-  async createSession(targetGroupId: string, endpoint: string, projectPath?: string): Promise<void> {
+  async createSession(targetGroupId: string, endpoint: string, projectPath?: string, profileId?: string): Promise<void> {
     const server = endpoint.trim();
     if (!server) {
       this.error = 'Choose a server.';
@@ -720,10 +721,17 @@ export class AppViewModel {
     const path = projectPath ?? this.homePathFor(server);
     this.error = null;
     try {
+      let profile = this.savedSessions.find((p) => p.id === profileId)
+        ?? this.savedSessions.find((p) => p.devicePaths[server] === path);
+      if (!profile && targetGroupId !== UNGROUPED_ID) {
+        profile = await this.client.saveSessionProfile({ name: this.groupName(server, path), endpoint: server, projectPath: path });
+        this.savedSessions = [...this.savedSessions, profile];
+      }
       const created = await this.client.createSession({
-        title: this.groupName(server, path),
+        title: profile?.name ?? this.groupName(server, path),
         endpoint: server,
         projectPath: path,
+        profileId: profile?.id,
       });
       this.sessions = [created, ...this.sessions];
       void this.syncSessionStatuses();
@@ -765,7 +773,7 @@ export class AppViewModel {
 
   /** Opens a shell for a saved profile: its device, at its saved folder. */
   async startSaved(profile: SavedSessionProfile, targetGroupId = this.selectedGroupId): Promise<void> {
-    await this.createSession(targetGroupId, profile.lastEndpoint, this.ungroupedPathFor(profile));
+    await this.createSession(targetGroupId, profile.lastEndpoint, this.ungroupedPathFor(profile), profile.id);
   }
 
   createGroup(): void {
@@ -982,15 +990,23 @@ export class AppViewModel {
   /** Runs an AI agent inside the session's shell, with that agent's default
    * model from settings. The header then shows it until it exits. */
   async launchAgent(sessionId: string, cli: CliKind): Promise<void> {
-    if (sessionId in this.runningAgents) return;
+    if (this.agentLaunches.has(sessionId)) return;
+    if (sessionId in this.runningAgents && this.sessions.find((s) => s.id === sessionId)?.endpoint === 'local') return;
     const session = this.sessions.find((item) => item.id === sessionId);
     if (session?.endpoint && session.endpoint !== 'local') void this.refreshAgentModels(session.endpoint, cli);
     const model = this.agentDefaultModels[cli] || undefined;
     const command = model ? `${AGENT_COMMANDS[cli]} --model ${this.shellQuote(model)}` : AGENT_COMMANDS[cli];
-    // Mark first so the typed-command detector in writeTerminal doesn't
-    // register the same launch a second time.
-    void this.markAgentRunning(sessionId, cli, model);
-    await this.writeTerminal(sessionId, `${command}\r`);
+    this.agentLaunches.add(sessionId);
+    try {
+      if (session?.endpoint !== 'local') {
+        const result = await this.client.launchSessionAgent(sessionId, cli, command);
+        await this.markAgentRunning(sessionId, result.cli, result.action === 'direct' ? model : undefined);
+      } else {
+        await this.markAgentRunning(sessionId, cli, model);
+        await this.writeTerminal(sessionId, `${command}\r`, true);
+      }
+    } catch (error) { this.error = this.message(error); }
+    finally { this.agentLaunches.delete(sessionId); }
   }
 
   /** Reopens pinned terminals after an app restart. Codex and Claude both
@@ -1113,6 +1129,16 @@ export class AppViewModel {
           const cli = recent[0] ?? this.availableAgents[0];
           const model = this.agentDefaultModels[cli] || undefined;
           input = taskAgentCommand(cli, prompt, model);
+          if (session.endpoint !== 'local') {
+            const result = await this.client.launchSessionAgent(sessionId, cli, input);
+            if (result.action !== 'direct') {
+              await this.markAgentRunning(sessionId, result.cli);
+              throw new Error('An existing agent was restored. Review its terminal, then run the tasks again when it is Ready.');
+            }
+            await this.markAgentRunning(sessionId, result.cli, model);
+            this.selectSession(sessionId);
+            return;
+          }
           await this.markAgentRunning(sessionId, cli, model);
         }
         try {
@@ -1515,6 +1541,11 @@ export class AppViewModel {
     const owner = localStorage.getItem(SESSION_SYNC_OWNER_KEY);
     const mayMigrateLocal = owner === null || owner === user.id;
     const previous = this.readSessionSyncState(user.id);
+    // Profiles and groups can change while this sync awaits the server (a
+    // shell's first `cd` renames a fresh session). Those edits are kept below
+    // instead of being overwritten by the snapshot, and pushed by the next run.
+    const profilesAtStart = new Map(this.savedSessions.map((profile) => [profile.id, JSON.stringify(profile)]));
+    const groupsAtStart = this.groupSignature();
     let snapshot = await this.client.syncSnapshot();
     const remote = this.activeSyncEntities(snapshot.entities);
     const local = await this.localSessionEntities(deviceId);
@@ -1563,14 +1594,22 @@ export class AppViewModel {
     }
 
     const finalRemote = this.activeSyncEntities(snapshot.entities);
-    const profiles = this.profilesFromSnapshot(finalRemote.profiles, finalRemote.devicePaths, deviceId);
+    const remoteProfiles = this.profilesFromSnapshot(finalRemote.profiles, finalRemote.devicePaths, deviceId);
+    const editedLocally = this.savedSessions.filter((profile) => profilesAtStart.get(profile.id) !== JSON.stringify(profile));
+    const removedLocally = new Set([...profilesAtStart.keys()].filter((id) => !this.savedSessions.some((profile) => profile.id === id)));
+    const profiles = [
+      ...remoteProfiles.filter((profile) => !removedLocally.has(profile.id) && !editedLocally.some((edited) => edited.id === profile.id)),
+      ...editedLocally,
+    ];
     await this.client.replaceSavedSessions(profiles);
     this.savedSessions = profiles;
+    const groupsEditedLocally = this.groupSignature() !== groupsAtStart;
+    if (editedLocally.length || removedLocally.size || groupsEditedLocally) this.sessionSyncPending = true;
     const remoteGroups = activeGroupEntities(snapshot.entities);
     const groups = groupError ? this.groupDefinitions : groupsFromEntities(remoteGroups.groups);
     this.applyingGroupSync = true;
     try {
-      if (!groupError) this.applyRemoteGroups(groups, defaultNameFromEntity(remoteGroups.defaultGroup), finalRemote.profiles);
+      if (!groupError && !groupsEditedLocally) this.applyRemoteGroups(groups, defaultNameFromEntity(remoteGroups.defaultGroup), finalRemote.profiles);
       this.pruneProfileLinks(new Set(profiles.map((profile) => profile.id)));
     } finally {
       this.applyingGroupSync = false;

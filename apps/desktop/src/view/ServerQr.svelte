@@ -1,15 +1,21 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import qrcode from 'qrcode-generator';
   import { serverQrPayload, type ServerQrConnection, type ServerQrCredentials } from '../domain/server-qr';
 
-  let { server, secretKind, loadCredentials, onClose }: {
+  let { server, secretKind, loadCredentials, onClose, autoSecret = false, ttlSeconds = 0 }: {
     server: ServerQrConnection;
     secretKind: 'password' | 'key';
     loadCredentials: () => Promise<ServerQrCredentials>;
     onClose: () => void;
+    /** Always embed the secret (no opt-in checkbox), e.g. a one-time phone key. */
+    autoSecret?: boolean;
+    /** Close automatically after this many seconds; 0 keeps the card open. */
+    ttlSeconds?: number;
   } = $props();
   let includeSecret = $state(false);
   let credentials = $state<ServerQrCredentials>({});
+  let remaining = $state(0);
   let error = $state('');
   let loading = $state(false);
   const link = $derived(serverQrPayload(server, includeSecret ? credentials : {}));
@@ -44,6 +50,17 @@
       loading = false;
     }
   }
+
+  onMount(() => {
+    if (autoSecret) void toggleSecret(true);
+    if (ttlSeconds <= 0) return;
+    remaining = ttlSeconds;
+    const timer = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) onClose();
+    }, 1000);
+    return () => { clearInterval(timer); credentials = {}; };
+  });
 </script>
 
 <div class="qr-card" role="dialog" aria-label={`QR code for ${server.name}`}>
@@ -54,9 +71,11 @@
     <path d={path.d} fill="#000" />
   </svg>
   {:else}<small class="qr-error">Too much data for a QR code. Turn off the password/key option.</small>{/if}
-  <label class="qr-secret"><input type="checkbox" checked={includeSecret || loading} disabled={loading} onchange={(event) => void toggleSecret(event.currentTarget.checked)} /> {loading ? 'Loading…' : `Include ${secretKind === 'password' ? 'password' : 'private key'}`}</label>
+  {#if !autoSecret}<label class="qr-secret"><input type="checkbox" checked={includeSecret || loading} disabled={loading} onchange={(event) => void toggleSecret(event.currentTarget.checked)} /> {loading ? 'Loading…' : `Include ${secretKind === 'password' ? 'password' : 'private key'}`}</label>{/if}
   {#if error}<small class="qr-error">{error}</small>{/if}
+  {#if ttlSeconds > 0}<small>Closes in {remaining}s</small>{/if}
   <small>{server.username}@{server.host}:{server.port}</small>
+  {#if server.jump}<small>via {server.jump.user}@{server.jump.host}:{server.jump.port}</small>{/if}
   <small class="qr-note">{includeSecret ? 'This QR contains your credentials. Scan it privately and close it afterwards.' : 'Scan with the aissh app. Credentials are not included; enter them in the app.'}</small>
 </div>
 
