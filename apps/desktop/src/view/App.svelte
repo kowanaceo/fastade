@@ -13,6 +13,8 @@
   import TerminalPane from './TerminalPane.svelte';
   import ShellPopup from './ShellPopup.svelte';
   import VoiceInput from './VoiceInput.svelte';
+  import PhoneLogin from './PhoneLogin.svelte';
+  import TunnelSettings from './TunnelSettings.svelte';
   import { voiceMessages } from './voice-input-messages';
 
   const recordRepository = new TauriSessionRecordRepository();
@@ -462,29 +464,6 @@
         <button class="primary" onclick={() => void viewModel.startLocalShell()}>Local</button>
         <button class="primary secondary" onclick={() => viewModel.openServerPicker()}>Remote</button>
       </div>
-      {#if viewModel.ungroupedProfiles.length}
-        <section class="ungrouped-profiles" aria-label="Ungrouped">
-          <button class="section-heading" aria-expanded={ungroupedOpen} onclick={() => { ungroupedOpen = !ungroupedOpen; }}>
-            <span>UNGROUPED · {viewModel.ungroupedProfiles.length}</span><span aria-hidden="true">{ungroupedOpen ? '⌃' : '⌄'}</span>
-          </button>
-          {#if ungroupedOpen}
-            {#each viewModel.ungroupedProfiles as profile (profile.id)}
-              {@const path = viewModel.ungroupedPathFor(profile)}
-              <div class="session-row">
-                <button class="session-select" title={`Start a shell on ${viewModel.endpointLabel(profile.lastEndpoint)}:${path}`} onclick={() => void viewModel.startSaved(profile)}>
-                  <span class="status" data-status="disconnected"></span><span><strong>{profile.name}</strong><small>{profile.lastEndpoint === 'local' ? 'local' : `ssh:${viewModel.endpointLabel(profile.lastEndpoint)}`} · {path}</small></span>
-                </button>
-                <button
-                  class="entry-action remove"
-                  title="Remove"
-                  aria-label={`Remove ${profile.name}`}
-                  onclick={() => void viewModel.removeUngroupedProfile(profile.id)}
-                >×</button>
-              </div>
-            {/each}
-          {/if}
-        </section>
-      {/if}
       <nav class="group-nav" aria-label="Group list">
         <form class="new-group" onsubmit={(event) => { event.preventDefault(); viewModel.createGroup(); }}>
           <input bind:value={viewModel.draftGroupName} aria-label="New group name" placeholder="New group" />
@@ -496,6 +475,29 @@
         </div>
         <input class="group-search" type="search" bind:value={groupQuery} aria-label="Search groups and sessions" placeholder="Search" />
         <div class="group-list">
+        {#if viewModel.ungroupedProfiles.length}
+          <section class="ungrouped-profiles" aria-label="Ungrouped">
+            <button class="section-heading" aria-expanded={ungroupedOpen} onclick={() => { ungroupedOpen = !ungroupedOpen; }}>
+              <span>UNGROUPED · {viewModel.ungroupedProfiles.length}</span><span aria-hidden="true">{ungroupedOpen ? '⌃' : '⌄'}</span>
+            </button>
+            {#if ungroupedOpen}
+              {#each viewModel.ungroupedProfiles as profile (profile.id)}
+                {@const path = viewModel.ungroupedPathFor(profile)}
+                <div class="session-row">
+                  <button class="session-select" title={`Start a shell on ${viewModel.endpointLabel(profile.lastEndpoint)}:${path}`} onclick={() => void viewModel.startSaved(profile)}>
+                    <span class="status" data-status="disconnected"></span><span><strong>{profile.name}</strong><small>{profile.lastEndpoint === 'local' ? 'local' : `ssh:${viewModel.endpointLabel(profile.lastEndpoint)}`} · {path}</small></span>
+                  </button>
+                  <button
+                    class="entry-action remove"
+                    title="Remove"
+                    aria-label={`Remove ${profile.name}`}
+                    onclick={() => void viewModel.removeUngroupedProfile(profile.id)}
+                  >×</button>
+                </div>
+              {/each}
+            {/if}
+          </section>
+        {/if}
         {#each visibleGroups as group (group.id)}
           {@const groupTasks = [...new Set(group.entries.flatMap((entry) => entry.profileId ?? []))].reduce((sum, id) => sum + (openTaskCounts[id] ?? 0), 0)}
           <section
@@ -758,6 +760,8 @@
         {/if}
         {#if viewModel.authError}<p class="account-note error-note">{viewModel.authError}</p>{:else if !viewModel.googleLoginConfigured}<p class="account-note">Add a Google Desktop OAuth client to enable login.</p>{/if}
       </section>
+      <TunnelSettings client={viewModel.client} authenticated={viewModel.authenticated} />
+      <PhoneLogin client={viewModel.client} />
       <div class="settings-section-heading"><strong>AI agents</strong><small>Manage web chat and usage pages.</small></div>
       <div class="agent-settings-list">
         {#each viewModel.webAgents as agent (agent.id)}

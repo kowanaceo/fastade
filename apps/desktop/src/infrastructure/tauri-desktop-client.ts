@@ -4,8 +4,39 @@ import { open } from '@tauri-apps/plugin-dialog';
 import type { CreateSessionInput, DesktopClient, RemoteDirectoryListing, SaveSessionInput, SshHost, TerminalEvent } from '../application/desktop-client';
 import type { AgentAccount, AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
 import type { SshHostQr } from '../domain/server-qr';
+import type { PhoneKey, PhoneQr, TunnelSettings, TunnelStatus } from '../domain/tunnel';
+import type { AgentLaunchResult } from '../domain/remote-session';
 
 export class TauriDesktopClient implements DesktopClient {
+  launchSessionAgent(sessionId: string, cli: CliKind, command: string): Promise<AgentLaunchResult> { return invoke('launch_session_agent', { sessionId, cli, command }); }
+  createPhoneQr(name?: string): Promise<PhoneQr> {
+    return invoke<PhoneQr>('create_phone_qr', { name: name?.trim() || null });
+  }
+
+  listPhoneKeys(): Promise<PhoneKey[]> {
+    return invoke<PhoneKey[]>('list_phone_keys');
+  }
+
+  revokePhoneKey(id: string): Promise<void> {
+    return invoke<void>('revoke_phone_key', { id });
+  }
+
+  tunnelStatus(): Promise<TunnelStatus> {
+    return invoke<TunnelStatus>('tunnel_status');
+  }
+
+  saveTunnelSettings(settings: TunnelSettings): Promise<TunnelStatus> {
+    return invoke<TunnelStatus>('save_tunnel_settings', { settings });
+  }
+
+  setTunnelEnabled(enabled: boolean): Promise<TunnelStatus> {
+    return invoke<TunnelStatus>('set_tunnel_enabled', { enabled });
+  }
+
+  async subscribeToTunnelChanges(handler: (status: TunnelStatus) => void): Promise<() => void> {
+    return listen<TunnelStatus>('tunnel-changed', (event) => handler(event.payload));
+  }
+
   listSessions(): Promise<CliSessionSummary[]> {
     return invoke<CliSessionSummary[]>('list_sessions');
   }

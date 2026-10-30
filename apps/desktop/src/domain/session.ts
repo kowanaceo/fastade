@@ -31,6 +31,7 @@ export interface CliSessionSummary {
   lastModels?: Partial<Record<CliKind, AgentModelInfo>>;
   endpoint: string;
   projectPath: string;
+  profileId?: string;
   status: SessionStatus;
 }
 

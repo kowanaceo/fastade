@@ -99,7 +99,7 @@ pub fn google_auth_status() -> AuthStatus {
 }
 
 #[tauri::command]
-pub async fn google_sign_in() -> Result<AuthUser, String> {
+pub async fn google_sign_in(app: tauri::AppHandle) -> Result<AuthUser, String> {
     if GOOGLE_CLIENT_ID.is_empty() {
         return Err("Google OAuth is not configured for this build.".to_owned());
     }
@@ -188,18 +188,25 @@ pub async fn google_sign_in() -> Result<AuthUser, String> {
         .map_err(|error| format!("Could not reach the fastade server: {error}"))?;
     let session: BackendSession = response_json(response, "Fastade rejected the login").await?;
     let user = session.user.clone();
+    use tauri::Manager;
+    let manager = app.state::<crate::tunnel::TunnelManager>().inner().clone();
+    let _transition = manager.stop_for_account_change().await;
     write_session(&session)?;
     Ok(user)
 }
 
 #[tauri::command]
-pub async fn google_sign_out() -> Result<(), String> {
+pub async fn google_sign_out(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let manager = app.state::<crate::tunnel::TunnelManager>().inner().clone();
+    let _transition = manager.stop_for_account_change().await;
     // Local sign-out must always succeed even if the network is unavailable.
     // The remote session will then expire naturally; when reachable, revoke it
     // first so the refresh token cannot be reused.
     if let Some(session) = read_session() {
         let _ = reqwest::Client::new()
             .post(format!("{BACKEND_BASE_URL}/auth/logout"))
+            .timeout(Duration::from_secs(8))
             .bearer_auth(session.access_token)
             .json(&serde_json::json!({ "allDevices": false }))
             .send()
@@ -342,6 +349,212 @@ fn read_session() -> Option<BackendSession> {
 /// shell or config file.
 pub(crate) fn is_signed_in() -> bool {
     read_session().is_some()
+}
+
+/// Pin a tunnel to the login that enabled it. It must never migrate to a
+/// different account when the app signs out or changes accounts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TunnelIdentity {
+    pub user_id: String,
+    pub device_id: String,
+}
+
+pub(crate) fn tunnel_identity() -> Option<TunnelIdentity> {
+    read_session().map(|session| TunnelIdentity {
+        user_id: session.user.id,
+        device_id: session.device.device_id,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TunnelRegistration {
+    pub device_id: String,
+    pub port: u16,
+}
+
+pub(crate) async fn report_tunnel(
+    identity: &TunnelIdentity,
+    on: bool,
+    hostname: &str,
+) -> Result<TunnelRegistration, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|_| "network".to_owned())?;
+    let mut session = read_session().ok_or("auth")?;
+    let body = serde_json::json!({ "on": on, "hostname": hostname });
+    for attempt in 0..2 {
+        if tunnel_identity().as_ref() != Some(identity)
+            || session.user.id != identity.user_id
+            || session.device.device_id != identity.device_id
+        {
+            return Err("auth".into());
+        }
+        let response = client
+            .put(format!("{BACKEND_BASE_URL}/tunnels/me"))
+            .bearer_auth(&session.access_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| "network".to_owned())?;
+        match response.status() {
+            reqwest::StatusCode::UNAUTHORIZED if attempt == 0 => {
+                session = refresh_session_if_needed(&client, session)
+                    .await
+                    .map_err(|_| "auth".to_owned())?;
+            }
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                return Err("auth".into());
+            }
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED => {
+                return Err("api_unavailable".into());
+            }
+            status if status.is_success() => {
+                let registration: TunnelRegistration =
+                    response.json().await.map_err(|_| "report".to_owned())?;
+                if registration.device_id != identity.device_id || registration.port == 0 {
+                    return Err("report".into());
+                }
+                return Ok(registration);
+            }
+            _ => return Err("report".into()),
+        }
+    }
+    Err("auth".into())
+}
+
+/// Upload the tunnel's public key (`ssh-ed25519 <base64>` only). The backend
+/// builds the restricted authorized_keys entry itself; re-sending the same key
+/// is a no-op.
+pub(crate) async fn register_tunnel_key(
+    identity: &TunnelIdentity,
+    public_key: &str,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|_| "network".to_owned())?;
+    let mut session = read_session().ok_or("auth")?;
+    let body = serde_json::json!({ "publicKey": public_key });
+    for attempt in 0..2 {
+        if tunnel_identity().as_ref() != Some(identity)
+            || session.user.id != identity.user_id
+            || session.device.device_id != identity.device_id
+        {
+            return Err("auth".into());
+        }
+        let response = client
+            .put(format!("{BACKEND_BASE_URL}/tunnels/me/key"))
+            .bearer_auth(&session.access_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| "network".to_owned())?;
+        match response.status() {
+            reqwest::StatusCode::UNAUTHORIZED if attempt == 0 => {
+                session = refresh_session_if_needed(&client, session)
+                    .await
+                    .map_err(|_| "auth".to_owned())?;
+            }
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                return Err("auth".into());
+            }
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED => {
+                return Err("api_unavailable".into());
+            }
+            reqwest::StatusCode::CONFLICT => return Err("key_in_use".into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY => return Err("key_rejected".into()),
+            status if status.is_success() => return Ok(()),
+            _ => return Err("report".into()),
+        }
+    }
+    Err("auth".into())
+}
+
+/// Where a phone reaches this device through the backend: it signs in to
+/// `jump_user@jump_host:jump_port`, then opens a forward to `target_host` on
+/// the device's tunnel port.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PhoneJumpRegistration {
+    pub jump_host: String,
+    pub jump_port: u16,
+    pub jump_user: String,
+    pub target_host: String,
+}
+
+/// An authenticated request to the tunnel API. Every status other than an
+/// authentication failure is returned for the caller to interpret.
+async fn tunnel_api(
+    identity: &TunnelIdentity,
+    method: reqwest::Method,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<reqwest::Response, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|_| "network".to_owned())?;
+    let mut session = read_session().ok_or("auth")?;
+    for attempt in 0..2 {
+        if tunnel_identity().as_ref() != Some(identity)
+            || session.user.id != identity.user_id
+            || session.device.device_id != identity.device_id
+        {
+            return Err("auth".into());
+        }
+        let response = client
+            .request(method.clone(), format!("{BACKEND_BASE_URL}{path}"))
+            .bearer_auth(&session.access_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| "network".to_owned())?;
+        match response.status() {
+            reqwest::StatusCode::UNAUTHORIZED if attempt == 0 => {
+                session = refresh_session_if_needed(&client, session)
+                    .await
+                    .map_err(|_| "auth".to_owned())?;
+            }
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                return Err("auth".into());
+            }
+            _ => return Ok(response),
+        }
+    }
+    Err("auth".into())
+}
+
+/// Authorize a phone key on the backend jump account, limited to forwarding to
+/// this device's tunnel port. Re-sending the same key is a no-op.
+pub(crate) async fn register_phone_key(
+    identity: &TunnelIdentity,
+    public_key: &str,
+    label: &str,
+) -> Result<PhoneJumpRegistration, String> {
+    let body = serde_json::json!({ "publicKey": public_key, "label": label });
+    let response = tunnel_api(identity, reqwest::Method::PUT, "/tunnels/me/phone-keys", &body).await?;
+    match response.status() {
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED => Err("api_unavailable".into()),
+        reqwest::StatusCode::CONFLICT => Err("key_in_use".into()),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY => Err("key_rejected".into()),
+        status if status.is_success() => response.json().await.map_err(|_| "report".to_owned()),
+        _ => Err("report".into()),
+    }
+}
+
+/// Remove a phone key from the backend. A key the backend does not know is
+/// already revoked.
+pub(crate) async fn revoke_phone_key(identity: &TunnelIdentity, public_key: &str) -> Result<(), String> {
+    let body = serde_json::json!({ "publicKey": public_key });
+    let response = tunnel_api(identity, reqwest::Method::DELETE, "/tunnels/me/phone-keys", &body).await?;
+    match response.status() {
+        reqwest::StatusCode::METHOD_NOT_ALLOWED => Err("api_unavailable".into()),
+        reqwest::StatusCode::NOT_FOUND => Ok(()),
+        status if status.is_success() => Ok(()),
+        _ => Err("report".into()),
+    }
 }
 
 fn write_session(session: &BackendSession) -> Result<(), String> {

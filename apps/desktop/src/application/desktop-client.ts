@@ -1,10 +1,13 @@
 import type { AgentAccount, AgentModelOption, AgentUsage, AuthStatus, AuthUser, CliKind, CliSessionSummary, CreateServerInput, CreatedServer, ManagedServer, SavedSessionProfile, SyncChangesResponse, SyncPushChange, SyncPushResponse, SyncSnapshot, UpdateServerInput, UsageSnapshot } from '../domain/session';
 import type { SshHostQr } from '../domain/server-qr';
+import type { PhoneKey, PhoneQr, TunnelSettings, TunnelStatus } from '../domain/tunnel';
+import type { AgentLaunchResult } from '../domain/remote-session';
 
 export interface CreateSessionInput {
   title: string;
   endpoint: string;
   projectPath: string;
+  profileId?: string;
   /** A popup shell, excluded from saved sessions and the session grid. */
   temporary?: boolean;
 }
@@ -31,6 +34,15 @@ export interface TerminalEvent {
 }
 
 export interface DesktopClient {
+  launchSessionAgent(sessionId: string, cli: CliKind, command: string): Promise<AgentLaunchResult>;
+  tunnelStatus(): Promise<TunnelStatus>;
+  saveTunnelSettings(settings: TunnelSettings): Promise<TunnelStatus>;
+  setTunnelEnabled(enabled: boolean): Promise<TunnelStatus>;
+  subscribeToTunnelChanges(handler: (status: TunnelStatus) => void): Promise<() => void>;
+  /** Registers a new phone key in authorized_keys; the private key is returned once. */
+  createPhoneQr(name?: string): Promise<PhoneQr>;
+  listPhoneKeys(): Promise<PhoneKey[]>;
+  revokePhoneKey(id: string): Promise<void>;
   listSessions(): Promise<CliSessionSummary[]>;
   listSavedSessions(): Promise<SavedSessionProfile[]>;
   saveSessionProfile(input: SaveSessionInput): Promise<SavedSessionProfile>;

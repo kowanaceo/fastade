@@ -13,6 +13,7 @@ A desktop client for running and managing Codex CLI, Claude Code, and Gemini CLI
 - Per-session terminal pop-out windows with activity status and memory usage
 - Codex and Claude Code usage display
 - Optional MCP integration for session state, notes/tasks, and shared global notes
+- macOS reverse SSH tunnel toggle with automatic reconnect, sleep prevention and backend heartbeat ([setup](docs/DESKTOP-TUNNEL.md))
 
 ## Requirements
 

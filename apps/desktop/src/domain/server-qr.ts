@@ -2,7 +2,17 @@ import type { ManagedServer } from './session.ts';
 
 export const SERVER_QR_SCHEME = 'aissh://add-server';
 
-export type ServerQrConnection = Pick<ManagedServer, 'name' | 'host' | 'port' | 'username'>;
+/** A host the phone signs in to first; `host`/`port` of the connection are then
+ * reached from it. The same key authenticates both hops. */
+export interface ServerQrJump {
+  host: string;
+  port: number;
+  user: string;
+}
+
+export type ServerQrConnection = Pick<ManagedServer, 'name' | 'host' | 'port' | 'username'> & {
+  jump?: ServerQrJump | null;
+};
 
 export interface SshHostQr extends ServerQrConnection, ServerQrCredentials {}
 
@@ -25,6 +35,11 @@ export function serverQrPayload(
     port: String(server.port),
     name: server.name,
   });
+  if (server.jump) {
+    query.set('jump_host', server.jump.host);
+    query.set('jump_port', String(server.jump.port));
+    query.set('jump_user', server.jump.user);
+  }
   if (credentials.password) query.set('pass', credentials.password);
   if (credentials.key) query.set('key', credentials.key);
   // URLSearchParams encodes spaces as '+', which some parsers keep literally.

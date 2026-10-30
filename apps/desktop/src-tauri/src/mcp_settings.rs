@@ -160,6 +160,23 @@ fn hook_command(binary: &Path, activity: &str) -> String {
     )
 }
 
+/// True for a command `hook_command` produced for any `fastade_mcp` binary,
+/// wherever that binary lives.
+fn is_fastade_hook_command(command: &str) -> bool {
+    let Some(program) = ["working", "waiting", "idle"]
+        .iter()
+        .find_map(|state| command.strip_suffix(&format!(" report-activity {state}")))
+    else {
+        return false;
+    };
+    let program = program
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .map(|inner| inner.replace("'\"'\"'", "'"))
+        .unwrap_or_else(|| program.to_owned());
+    Path::new(&program).file_name().and_then(|name| name.to_str()) == Some("fastade_mcp")
+}
+
 /// Claude exposes a direct PermissionRequest lifecycle event. Notification
 /// needs a matcher because it also fires for informational events such as
 /// auth success and ordinary idle prompts, which must not turn the badge
@@ -214,11 +231,6 @@ fn set_json_hooks_at(
 
     for &(event, activity, matcher) in events {
         let command = hook_command(binary, activity);
-        // Remove every activity state previously managed by fastade. This also
-        // migrates hooks written by older builds, where Stop/SessionStart used
-        // `waiting` instead of `idle`, without touching user-owned hooks.
-        let managed_commands =
-            ["working", "waiting", "idle"].map(|state| hook_command(binary, state));
         let groups = hooks_object
             .entry(event.to_owned())
             .or_insert_with(|| serde_json::json!([]));
@@ -227,13 +239,19 @@ fn set_json_hooks_at(
         }
         let array = groups.as_array_mut().expect("just normalized to an array");
 
+        // Remove every activity hook previously written by any fastade build —
+        // dev, freshly bundled, or installed — not just this binary's path.
+        // Otherwise each location the app ran from leaves its own copy and
+        // the CLI runs all of them, in sequence, on every event. This also
+        // migrates hooks written by older builds, where Stop/SessionStart used
+        // `waiting` instead of `idle`, without touching user-owned hooks.
         for group in array.iter_mut() {
             if let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) {
                 hooks.retain(|hook| {
-                    let existing = hook.get("command").and_then(Value::as_str);
-                    !managed_commands
-                        .iter()
-                        .any(|managed| existing == Some(managed.as_str()))
+                    !hook
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_fastade_hook_command)
                 });
             }
         }
@@ -619,6 +637,37 @@ mod hook_tests {
         assert_eq!(
             written["hooks"]["Stop"][0]["hooks"][0]["command"],
             "echo mine"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replaces_hooks_left_by_fastade_builds_at_other_paths() {
+        let dir = temp_dir();
+        let path = dir.join("hooks.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]},{"hooks":[{"type":"command","command":"'/dev/target/debug/fastade_mcp' report-activity idle"}]},{"hooks":[{"type":"command","command":"'/dev/target/release/bundle/macos/fastade.app/Contents/MacOS/fastade_mcp' report-activity waiting"}]},{"hooks":[{"type":"command","command":"'/opt/other_mcp' report-activity idle"}]}]}}"#,
+        )
+        .unwrap();
+        let binary = Path::new("/Applications/fastade.app/Contents/MacOS/fastade_mcp");
+
+        set_codex_hooks_at(&path, true, binary).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let commands: Vec<_> = written["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["hooks"][0]["command"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "echo mine".to_owned(),
+                "'/opt/other_mcp' report-activity idle".to_owned(),
+                hook_command(binary, "idle"),
+            ]
         );
 
         fs::remove_dir_all(&dir).unwrap();
